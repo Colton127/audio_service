@@ -1,4 +1,4 @@
-#import "./include/audio_service/AudioServicePlugin.h"
+#import "AudioServicePlugin.h"
 #import <AVFoundation/AVFoundation.h>
 #import <MediaPlayer/MediaPlayer.h>
 
