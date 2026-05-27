@@ -573,15 +573,21 @@ public class AudioService extends MediaBrowserServiceCompat {
             exitPlayingState();
         }
 
-        if (oldProcessingState != AudioProcessingState.idle && processingState == AudioProcessingState.idle) {
-            legacyStopForeground(true);
-            releaseWakeLock();
-            stop();
-        } else if (processingState == AudioProcessingState.completed) {
-            if (config.androidStopForegroundOnCompleted) {
-                exitForegroundState();
+
+        if (oldProcessingState != processingState) {
+            if (processingState == AudioProcessingState.idle) {
+                legacyStopForeground(true);
+                releaseWakeLock();
+                stop();
+            } else if (processingState == AudioProcessingState.completed) {
+                if (config.androidStopForegroundOnCompleted) {
+                    legacyStopForeground(false);
+                }
+                releaseWakeLock();
             }
-        } else if (processingState != AudioProcessingState.idle && notificationChanged) {
+        }
+
+        if (processingState != AudioProcessingState.idle && notificationChanged) {
             updateNotification();
         }
     }
