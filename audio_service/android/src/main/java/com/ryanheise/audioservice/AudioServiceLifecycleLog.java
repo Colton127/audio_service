@@ -8,7 +8,9 @@ import android.util.Log;
  *
  * <p>Every line is emitted on a single line with a consistent tag and
  * {@code key=value} fields so it is easy to grep in Logcat or to attach as a
- * Sentry breadcrumb. This class has no effect on lifecycle behaviour.
+ * breadcrumb by a crash reporter. Lifecycle lines are logged at WARN level so
+ * that reporters which only capture WARN and above still see them. This class
+ * has no effect on lifecycle behaviour.
  */
 final class AudioServiceLifecycleLog {
     static final String TAG = "AudioServiceLifecycle";
@@ -28,7 +30,7 @@ final class AudioServiceLifecycleLog {
         if (fields != null && !fields.isEmpty()) {
             sb.append(' ').append(fields);
         }
-        Log.i(TAG, sb.toString());
+        Log.w(TAG, sb.toString());
     }
 
     /** Identity hash of an object, or {@code none} when null. */

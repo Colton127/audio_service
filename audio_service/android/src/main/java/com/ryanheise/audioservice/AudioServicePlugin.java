@@ -97,6 +97,8 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             // Bump the generation before the engine is constructed, since the
             // constructor synchronously triggers onAttachedToEngine.
             flutterEngineGeneration++;
+            log("flutter_engine_create_begin", "generation=" + flutterEngineGeneration
+                    + " requester=" + requester);
             // XXX: The constructor triggers onAttachedToEngine so this variable doesn't help us.
             // Maybe need a boolean flag to tell us we're currently loading the main flutter engine.
             flutterEngine = new FlutterEngine(context.getApplicationContext());
@@ -137,10 +139,14 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             flutterEngine.getDartExecutor().executeDartEntrypoint(DartExecutor.DartEntrypoint.createDefault());
             FlutterEngineCache.getInstance().put(flutterEngineId, flutterEngine);
             log("flutter_engine_created", "generation=" + flutterEngineGeneration
-                    + " engineHash=" + hashOf(flutterEngine) + " requester=" + requester);
+                    + " engineHash=" + hashOf(flutterEngine)
+                    + " messengerHash=" + hashOf(flutterEngine.getDartExecutor())
+                    + " requester=" + requester);
         } else {
             log("flutter_engine_reused", "generation=" + flutterEngineGeneration
-                    + " engineHash=" + hashOf(flutterEngine) + " requester=" + requester);
+                    + " engineHash=" + hashOf(flutterEngine)
+                    + " messengerHash=" + hashOf(flutterEngine.getDartExecutor())
+                    + " requester=" + requester);
         }
         return flutterEngine;
     }
@@ -160,12 +166,17 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         }
         FlutterEngine flutterEngine = FlutterEngineCache.getInstance().get(flutterEngineId);
         if (flutterEngine != null) {
+            // Captured before destroy() so both lines correlate with the same
+            // messenger identity.
+            final String messengerHash = hashOf(flutterEngine.getDartExecutor());
             log("flutter_engine_destroy_begin", "generation=" + flutterEngineGeneration
-                    + " engineHash=" + hashOf(flutterEngine));
+                    + " engineHash=" + hashOf(flutterEngine)
+                    + " messengerHash=" + messengerHash);
             flutterEngine.destroy();
             FlutterEngineCache.getInstance().remove(flutterEngineId);
             log("flutter_engine_destroyed", "generation=" + flutterEngineGeneration
-                    + " engineHash=" + hashOf(flutterEngine));
+                    + " engineHash=" + hashOf(flutterEngine)
+                    + " messengerHash=" + messengerHash);
         } else {
             log("flutter_engine_dispose_skipped", "generation=" + flutterEngineGeneration
                     + " reason=no_engine");
@@ -306,7 +317,8 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
     @Override
     public void onAttachedToEngine(FlutterPluginBinding binding) {
-        log("plugin_attached_to_engine", "generation=" + flutterEngineGeneration);
+        log("plugin_attached_to_engine", "generation=" + flutterEngineGeneration
+                + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
         flutterPluginBinding = binding;
         clientInterface = new ClientInterface(flutterPluginBinding.getBinaryMessenger());
         clientInterface.setContext(flutterPluginBinding.getApplicationContext());
@@ -328,7 +340,8 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
     @Override
     public void onDetachedFromEngine(FlutterPluginBinding binding) {
-        log("plugin_detached_from_engine", "generation=" + flutterEngineGeneration);
+        log("plugin_detached_from_engine", "generation=" + flutterEngineGeneration
+                + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
         if (clientInterfaces.size() == 1) {
             disconnect();
         }
@@ -338,9 +351,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         applicationContext = null;
         if (audioHandlerInterface != null
                 && audioHandlerInterface.messenger == flutterPluginBinding.getBinaryMessenger()) {
-            Log.i(AudioServiceLifecycleLog.TAG, "destroying audio handler interface");
             audioHandlerInterface.destroy();
             audioHandlerInterface = null;
+            log("audio_handler_interface_destroyed", "generation=" + flutterEngineGeneration
+                    + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
         }
         flutterPluginBinding = null;
     }
@@ -894,7 +908,12 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             // still disposed in the normal flows, where playback has already
             // been stopped or paused by the time the service is destroyed.
             if (AudioService.instance == null || !AudioService.instance.isPlaying()) {
+                log("flutter_engine_dispose_on_service_destroy",
+                        "generation=" + flutterEngineGeneration);
                 disposeFlutterEngine();
+            } else {
+                log("flutter_engine_retained", "generation=" + flutterEngineGeneration
+                        + " reason=service_destroyed_while_playing");
             }
         }
 

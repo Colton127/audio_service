@@ -401,9 +401,11 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     private void legacyStopForeground(boolean removeNotification, String reason) {
-        log("foreground_stop", "serviceGeneration=" + serviceGeneration
-                + " reason=" + reason + " removeNotification=" + removeNotification);
+        final String fields = "serviceGeneration=" + serviceGeneration
+                + " reason=" + reason + " removeNotification=" + removeNotification;
+        log("foreground_stop_requested", fields);
         legacyStopForeground(removeNotification);
+        log("foreground_stopped", fields);
     }
 
     @SuppressWarnings("deprecation")
@@ -770,9 +772,11 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     private void internalStartForeground() {
-        log("foreground_start", "serviceGeneration=" + serviceGeneration
-                + " reason=enter_playing_state");
+        final String fields = "serviceGeneration=" + serviceGeneration
+                + " reason=enter_playing_state";
+        log("foreground_start_requested", fields);
         startForeground(NOTIFICATION_ID, buildNotification());
+        log("foreground_started", fields);
         notificationCreated = true;
     }
 
