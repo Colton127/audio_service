@@ -47,6 +47,9 @@ import java.util.Map;
 
 import io.flutter.embedding.engine.FlutterEngine;
 
+import static com.ryanheise.audioservice.AudioServiceLifecycleLog.hashOf;
+import static com.ryanheise.audioservice.AudioServiceLifecycleLog.log;
+
 public class AudioService extends MediaBrowserServiceCompat {
     public static final String CONTENT_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED";
     public static final String CONTENT_STYLE_PLAYABLE_HINT = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT";
@@ -281,6 +284,9 @@ public class AudioService extends MediaBrowserServiceCompat {
     private int repeatMode;
     private int shuffleMode;
     private boolean notificationCreated;
+    /** Process-local counter of AudioService instances. Diagnostic only. */
+    private static int serviceGenerationCounter;
+    private final int serviceGeneration = ++serviceGenerationCounter;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private VolumeProviderCompat volumeProvider;
 
@@ -302,6 +308,7 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     @Override
     public void onCreate() {
+        log("service_create_begin", "serviceGeneration=" + serviceGeneration);
         super.onCreate();
         instance = this;
         repeatMode = 0;
@@ -341,23 +348,33 @@ public class AudioService extends MediaBrowserServiceCompat {
             }
         };
 
+        log("service_engine_request", "serviceGeneration=" + serviceGeneration);
         flutterEngine = AudioServicePlugin.getFlutterEngine(this);
-        System.out.println("flutterEngine warmed up");
+        log("service_create_end", "serviceGeneration=" + serviceGeneration
+                + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
+                + " engineHash=" + hashOf(flutterEngine));
     }
 
     @Override
     public int onStartCommand(final Intent intent, int flags, int startId) {
+        log("service_start_command", "serviceGeneration=" + serviceGeneration
+                + " startId=" + startId + " flags=" + flags
+                + " action=" + (intent != null ? intent.getAction() : "none"));
         MediaButtonReceiver.handleIntent(mediaSession, intent);
         return START_NOT_STICKY;
     }
 
     public void stop() {
+        log("service_stop_requested", "serviceGeneration=" + serviceGeneration);
         deactivateMediaSession();
         stopSelf();
     }
 
     @Override
     public void onDestroy() {
+        log("service_destroy_begin", "serviceGeneration=" + serviceGeneration
+                + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
+                + " engineHash=" + hashOf(flutterEngine));
         super.onDestroy();
         if (listener != null) {
             listener.onDestroy();
@@ -371,7 +388,7 @@ public class AudioService extends MediaBrowserServiceCompat {
         artBitmapCache.evictAll();
         compactActionIndices = null;
         releaseMediaSession();
-        legacyStopForeground(!config.androidResumeOnClick);
+        legacyStopForeground(!config.androidResumeOnClick, "service_destroy");
         // This still does not solve the Android 11 problem.
         // if (notificationCreated) {
         //     NotificationManager notificationManager = getNotificationManager();
@@ -380,6 +397,13 @@ public class AudioService extends MediaBrowserServiceCompat {
         releaseWakeLock();
         instance = null;
         notificationCreated = false;
+        log("service_destroy_end", "serviceGeneration=" + serviceGeneration);
+    }
+
+    private void legacyStopForeground(boolean removeNotification, String reason) {
+        log("foreground_stop", "serviceGeneration=" + serviceGeneration
+                + " reason=" + reason + " removeNotification=" + removeNotification);
+        legacyStopForeground(removeNotification);
     }
 
     @SuppressWarnings("deprecation")
@@ -576,12 +600,12 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         if (oldProcessingState != processingState) {
             if (processingState == AudioProcessingState.idle) {
-                legacyStopForeground(true);
+                legacyStopForeground(true, "processing_state_idle");
                 releaseWakeLock();
                 stop();
             } else if (processingState == AudioProcessingState.completed) {
                 if (config.androidStopForegroundOnCompleted) {
-                    legacyStopForeground(false);
+                    legacyStopForeground(false, "processing_state_completed");
                 }
                 releaseWakeLock();
             }
@@ -741,11 +765,13 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     private void exitForegroundState() {
-        legacyStopForeground(false);
+        legacyStopForeground(false, "exit_playing_state");
         releaseWakeLock();
     }
 
     private void internalStartForeground() {
+        log("foreground_start", "serviceGeneration=" + serviceGeneration
+                + " reason=enter_playing_state");
         startForeground(NOTIFICATION_ID, buildNotification());
         notificationCreated = true;
     }
@@ -881,6 +907,7 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
+        log("service_task_removed", "serviceGeneration=" + serviceGeneration);
         if (listener != null) {
             listener.onTaskRemoved();
         }
