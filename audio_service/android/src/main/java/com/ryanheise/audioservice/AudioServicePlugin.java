@@ -959,6 +959,49 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             invokeMethod("onNotificationDeleted", mapOf());
         }
 
+        // The last values projected from the Dart AudioHandler. They are kept
+        // on this object, which lives as long as the engine, so that an
+        // AudioService instance created while the engine survived can be
+        // brought back to the handler's current state (see onCreate).
+        private Map<?, ?> lastStateArgs;
+        private Map<?, ?> lastMediaItemArgs;
+        private Map<?, ?> lastQueueArgs;
+        private Map<?, ?> lastPlaybackInfoArgs;
+
+        @Override
+        public void onCreate() {
+            // A new AudioService instance starts with an empty MediaSession
+            // while the Dart handler's streams still hold the current state
+            // and will not re-emit it. Re-project the last known values,
+            // exactly once, through the same paths as the live updates, but
+            // as a replay: no transition-specific side effects.
+            if (lastStateArgs == null && lastMediaItemArgs == null
+                    && lastQueueArgs == null && lastPlaybackInfoArgs == null) {
+                return;
+            }
+            log("service_state_replay", "generation=" + flutterEngineGeneration
+                    + " state=" + (lastStateArgs != null)
+                    + " mediaItem=" + (lastMediaItemArgs != null)
+                    + " queue=" + (lastQueueArgs != null)
+                    + " playbackInfo=" + (lastPlaybackInfoArgs != null));
+            try {
+                if (lastPlaybackInfoArgs != null) {
+                    applyPlaybackInfo(lastPlaybackInfoArgs);
+                }
+                if (lastStateArgs != null) {
+                    applyState(lastStateArgs, true);
+                }
+            } catch (Exception e) {
+                Log.e(AudioServiceLifecycleLog.TAG, "state replay failed: " + e.getMessage(), e);
+            }
+            if (lastMediaItemArgs != null) {
+                applyMediaItem(lastMediaItemArgs, null);
+            }
+            if (lastQueueArgs != null) {
+                applyQueue(lastQueueArgs, null);
+            }
+        }
+
         @Override
         public void onDestroy() {
             // The OS may stop the service while audio is still playing, e.g.
@@ -987,109 +1030,24 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 Map<?, ?> args = (Map<?, ?>)call.arguments;
                 switch (call.method) {
                 case "setMediaItem": {
-                    Executors.newSingleThreadExecutor().execute(() -> {
-                        try {
-                            Map<?, ?> rawMediaItem = (Map<?, ?>)args.get("mediaItem");
-                            MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
-                            AudioService.instance.setMetadata(mediaMetadata);
-                            handler.post(() -> result.success(null));
-                        } catch (Exception e) {
-                            handler.post(() -> {
-                                result.error("UNEXPECTED_ERROR", "Unexpected error", Log.getStackTraceString(e));
-                            });
-                        }
-                    });
+                    lastMediaItemArgs = args;
+                    applyMediaItem(args, result);
                     break;
                 }
                 case "setQueue": {
-                    Executors.newSingleThreadExecutor().execute(() -> {
-                        try {
-                            @SuppressWarnings("unchecked") List<Map<?, ?>> rawQueue = (List<Map<?, ?>>) args.get("queue");
-                            List<MediaSessionCompat.QueueItem> queue = raw2queue(rawQueue);
-                            AudioService.instance.setQueue(queue);
-                            handler.post(() -> result.success(null));
-                        } catch (Exception e) {
-                            handler.post(() -> {
-                                result.error("UNEXPECTED_ERROR", "Unexpected error", Log.getStackTraceString(e));
-                            });
-                        }
-                    });
+                    lastQueueArgs = args;
+                    applyQueue(args, result);
                     break;
                 }
                 case "setState": {
-                    Map<?, ?> stateMap = (Map<?, ?>)args.get("state");
-                    AudioProcessingState processingState = AudioProcessingState.values()[(Integer)stateMap.get("processingState")];
-                    boolean playing = (Boolean)stateMap.get("playing");
-                    @SuppressWarnings("unchecked") List<Map<?, ?>> rawControls = (List<Map<?, ?>>)stateMap.get("controls");
-                    @SuppressWarnings("unchecked") List<Object> compactActionIndexList = (List<Object>)stateMap.get("androidCompactActionIndices");
-                    @SuppressWarnings("unchecked") List<Integer> rawSystemActions = (List<Integer>)stateMap.get("systemActions");
-                    long position = getLong(stateMap.get("updatePosition"));
-                    long bufferedPosition = getLong(stateMap.get("bufferedPosition"));
-                    float speed = (float)((double)((Double)stateMap.get("speed")));
-                    long updateTimeSinceEpoch = stateMap.get("updateTime") == null ? System.currentTimeMillis() : getLong(stateMap.get("updateTime"));
-                    Integer errorCode = (Integer)stateMap.get("errorCode");
-                    String errorMessage = (String)stateMap.get("errorMessage");
-                    int repeatMode = (Integer)stateMap.get("repeatMode");
-                    int shuffleMode = (Integer)stateMap.get("shuffleMode");
-                    Long queueIndex = getLong(stateMap.get("queueIndex"));
-                    boolean captioningEnabled = (Boolean)stateMap.get("captioningEnabled");
-
-                    // On the flutter side, we represent the update time relative to the epoch.
-                    // On the native side, we must represent the update time relative to the boot time.
-                    long updateTimeSinceBoot = updateTimeSinceEpoch - bootTime;
-
-                    List<MediaControl> actions = new ArrayList<>();
-                    long actionBits = 0;
-                    for (Map<?, ?> rawControl : rawControls) {
-                        String resource = (String)rawControl.get("androidIcon");
-                        String label = (String)rawControl.get("label");
-                        long actionCode = 1 << ((Integer)rawControl.get("action"));
-                        actionBits |= actionCode;
-                        Map<?, ?> customActionMap = (Map<?, ?>)rawControl.get("customAction");
-                        CustomMediaAction customAction = null;
-                        if (customActionMap != null) {
-                            String name = (String) customActionMap.get("name");
-                            Map<?, ?> extras = (Map<?, ?>) customActionMap.get("extras");
-                            customAction = new CustomMediaAction(name, extras);
-                        }
-                        actions.add(new MediaControl(resource, label, actionCode, customAction));
-                    }
-                    for (Integer rawSystemAction : rawSystemActions) {
-                        long actionCode = 1 << rawSystemAction;
-                        actionBits |= actionCode;
-                    }
-                    int[] compactActionIndices = null;
-                    if (compactActionIndexList != null) {
-                        compactActionIndices = new int[Math.min(AudioService.MAX_COMPACT_ACTIONS, compactActionIndexList.size())];
-                        for (int i = 0; i < compactActionIndices.length; i++)
-                            compactActionIndices[i] = (Integer)compactActionIndexList.get(i);
-                    }
-                    AudioService.instance.setState(
-                            actions,
-                            actionBits,
-                            compactActionIndices,
-                            processingState,
-                            playing,
-                            position,
-                            bufferedPosition,
-                            speed,
-                            updateTimeSinceBoot,
-                            errorCode,
-                            errorMessage,
-                            repeatMode,
-                            shuffleMode,
-                            captioningEnabled,
-                            queueIndex);
+                    lastStateArgs = args;
+                    applyState(args, false);
                     result.success(null);
                     break;
                 }
                 case "setAndroidPlaybackInfo": {
-                    Map<?, ?> playbackInfo = (Map<?, ?>)args.get("playbackInfo");
-                    final int playbackType = (Integer)playbackInfo.get("playbackType");
-                    final Integer volumeControlType = (Integer)playbackInfo.get("volumeControlType");
-                    final Integer maxVolume = (Integer)playbackInfo.get("maxVolume");
-                    final Integer volume = (Integer)playbackInfo.get("volume");
-                    AudioService.instance.setPlaybackInfo(playbackType, volumeControlType, maxVolume, volume);
+                    lastPlaybackInfoArgs = args;
+                    applyPlaybackInfo(args);
                     result.success(null);
                     break;
                 }
@@ -1151,6 +1109,129 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 e.printStackTrace();
                 result.error(e.getMessage(), null, null);
             }
+        }
+
+
+        /** Projects a media item; {@code result} is null when replaying. */
+        private void applyMediaItem(Map<?, ?> args, final Result result) {
+            Executors.newSingleThreadExecutor().execute(() -> {
+                try {
+                    Map<?, ?> rawMediaItem = (Map<?, ?>)args.get("mediaItem");
+                    MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
+                    AudioService.instance.setMetadata(mediaMetadata);
+                    if (result != null) {
+                        handler.post(() -> result.success(null));
+                    }
+                } catch (Exception e) {
+                    if (result != null) {
+                        handler.post(() -> {
+                            result.error("UNEXPECTED_ERROR", "Unexpected error", Log.getStackTraceString(e));
+                        });
+                    } else {
+                        Log.e(AudioServiceLifecycleLog.TAG, "media item replay failed: " + e.getMessage(), e);
+                    }
+                }
+            });
+        }
+
+        /** Projects the queue; {@code result} is null when replaying. */
+        private void applyQueue(Map<?, ?> args, final Result result) {
+            Executors.newSingleThreadExecutor().execute(() -> {
+                try {
+                    @SuppressWarnings("unchecked") List<Map<?, ?>> rawQueue = (List<Map<?, ?>>) args.get("queue");
+                    List<MediaSessionCompat.QueueItem> queue = raw2queue(rawQueue);
+                    AudioService.instance.setQueue(queue);
+                    if (result != null) {
+                        handler.post(() -> result.success(null));
+                    }
+                } catch (Exception e) {
+                    if (result != null) {
+                        handler.post(() -> {
+                            result.error("UNEXPECTED_ERROR", "Unexpected error", Log.getStackTraceString(e));
+                        });
+                    } else {
+                        Log.e(AudioServiceLifecycleLog.TAG, "queue replay failed: " + e.getMessage(), e);
+                    }
+                }
+            });
+        }
+
+        /** Projects a playback state; see AudioService.setState for {@code replay}. */
+        private void applyState(Map<?, ?> args, boolean replay) {
+            Map<?, ?> stateMap = (Map<?, ?>)args.get("state");
+            AudioProcessingState processingState = AudioProcessingState.values()[(Integer)stateMap.get("processingState")];
+            boolean playing = (Boolean)stateMap.get("playing");
+            @SuppressWarnings("unchecked") List<Map<?, ?>> rawControls = (List<Map<?, ?>>)stateMap.get("controls");
+            @SuppressWarnings("unchecked") List<Object> compactActionIndexList = (List<Object>)stateMap.get("androidCompactActionIndices");
+            @SuppressWarnings("unchecked") List<Integer> rawSystemActions = (List<Integer>)stateMap.get("systemActions");
+            long position = getLong(stateMap.get("updatePosition"));
+            long bufferedPosition = getLong(stateMap.get("bufferedPosition"));
+            float speed = (float)((double)((Double)stateMap.get("speed")));
+            long updateTimeSinceEpoch = stateMap.get("updateTime") == null ? System.currentTimeMillis() : getLong(stateMap.get("updateTime"));
+            Integer errorCode = (Integer)stateMap.get("errorCode");
+            String errorMessage = (String)stateMap.get("errorMessage");
+            int repeatMode = (Integer)stateMap.get("repeatMode");
+            int shuffleMode = (Integer)stateMap.get("shuffleMode");
+            Long queueIndex = getLong(stateMap.get("queueIndex"));
+            boolean captioningEnabled = (Boolean)stateMap.get("captioningEnabled");
+
+            // On the flutter side, we represent the update time relative to the epoch.
+            // On the native side, we must represent the update time relative to the boot time.
+            long updateTimeSinceBoot = updateTimeSinceEpoch - bootTime;
+
+            List<MediaControl> actions = new ArrayList<>();
+            long actionBits = 0;
+            for (Map<?, ?> rawControl : rawControls) {
+                String resource = (String)rawControl.get("androidIcon");
+                String label = (String)rawControl.get("label");
+                long actionCode = 1 << ((Integer)rawControl.get("action"));
+                actionBits |= actionCode;
+                Map<?, ?> customActionMap = (Map<?, ?>)rawControl.get("customAction");
+                CustomMediaAction customAction = null;
+                if (customActionMap != null) {
+                    String name = (String) customActionMap.get("name");
+                    Map<?, ?> extras = (Map<?, ?>) customActionMap.get("extras");
+                    customAction = new CustomMediaAction(name, extras);
+                }
+                actions.add(new MediaControl(resource, label, actionCode, customAction));
+            }
+            for (Integer rawSystemAction : rawSystemActions) {
+                long actionCode = 1 << rawSystemAction;
+                actionBits |= actionCode;
+            }
+            int[] compactActionIndices = null;
+            if (compactActionIndexList != null) {
+                compactActionIndices = new int[Math.min(AudioService.MAX_COMPACT_ACTIONS, compactActionIndexList.size())];
+                for (int i = 0; i < compactActionIndices.length; i++)
+                    compactActionIndices[i] = (Integer)compactActionIndexList.get(i);
+            }
+            AudioService.instance.setState(
+                    actions,
+                    actionBits,
+                    compactActionIndices,
+                    processingState,
+                    playing,
+                    position,
+                    bufferedPosition,
+                    speed,
+                    updateTimeSinceBoot,
+                    errorCode,
+                    errorMessage,
+                    repeatMode,
+                    shuffleMode,
+                    captioningEnabled,
+                    queueIndex,
+                    replay);
+        }
+
+        /** Projects the Android playback info (local/remote volume handling). */
+        private void applyPlaybackInfo(Map<?, ?> args) {
+            Map<?, ?> playbackInfo = (Map<?, ?>)args.get("playbackInfo");
+            final int playbackType = (Integer)playbackInfo.get("playbackType");
+            final Integer volumeControlType = (Integer)playbackInfo.get("volumeControlType");
+            final Integer maxVolume = (Integer)playbackInfo.get("maxVolume");
+            final Integer volume = (Integer)playbackInfo.get("volume");
+            AudioService.instance.setPlaybackInfo(playbackType, volumeControlType, maxVolume, volume);
         }
 
         @UiThread

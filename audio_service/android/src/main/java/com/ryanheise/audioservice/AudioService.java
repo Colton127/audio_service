@@ -280,6 +280,13 @@ public class AudioService extends MediaBrowserServiceCompat {
     private String notificationChannelId;
     private LruCache<String, Bitmap> artBitmapCache;
     private boolean playing = false;
+    /**
+     * Whether enterPlayingState() has run (and exitPlayingState() has not)
+     * on this instance. Distinct from {@link #playing}: a replayed state can
+     * report playing without the foreground service, notification and wake
+     * lock having been established on this instance yet.
+     */
+    private boolean playingStateEntered = false;
     private AudioProcessingState processingState = AudioProcessingState.idle;
     private int repeatMode;
     private int shuffleMode;
@@ -350,6 +357,12 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         log("service_engine_request", "serviceGeneration=" + serviceGeneration);
         flutterEngine = AudioServicePlugin.getFlutterEngine(this);
+        if (listener != null) {
+            // If this instance replaces a destroyed one while the engine (and
+            // the Dart AudioHandler) survived, the listener projects the
+            // current state into this fresh MediaSession.
+            listener.onCreate();
+        }
         log("service_create_end", "serviceGeneration=" + serviceGeneration
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
                 + " engineHash=" + hashOf(flutterEngine));
@@ -541,7 +554,19 @@ public class AudioService extends MediaBrowserServiceCompat {
         return PendingIntent.getBroadcast(this, 0, intent, flags);
     }
 
-    void setState(List<MediaControl> controls, long actionBits, int[] compactActionIndices, AudioProcessingState processingState, boolean playing, long position, long bufferedPosition, float speed, long updateTime, Integer errorCode, String errorMessage, int repeatMode, int shuffleMode, boolean captioningEnabled, Long queueIndex) {
+    /**
+     * Applies a playback state from the Dart AudioHandler.
+     *
+     * @param replay false for a live state update, which also runs the
+     *               transition-specific side effects (entering/leaving the
+     *               playing state, the idle and completed transitions, the
+     *               notification refresh). true when re-projecting the
+     *               handler's current state into a freshly created service
+     *               instance: only the native state (fields, MediaSession
+     *               playback state, modes) is restored and no transition is
+     *               assumed to have happened.
+     */
+    void setState(List<MediaControl> controls, long actionBits, int[] compactActionIndices, AudioProcessingState processingState, boolean playing, long position, long bufferedPosition, float speed, long updateTime, Integer errorCode, String errorMessage, int repeatMode, int shuffleMode, boolean captioningEnabled, Long queueIndex, boolean replay) {
         boolean notificationChanged = false;
         if (!Arrays.equals(compactActionIndices, this.compactActionIndices)) {
             notificationChanged = true;
@@ -561,7 +586,6 @@ public class AudioService extends MediaBrowserServiceCompat {
             }
         }
         this.compactActionIndices = compactActionIndices;
-        boolean wasPlaying = this.playing;
         AudioProcessingState oldProcessingState = this.processingState;
         this.processingState = processingState;
         this.playing = playing;
@@ -597,9 +621,22 @@ public class AudioService extends MediaBrowserServiceCompat {
         mediaSession.setShuffleMode(shuffleMode);
         mediaSession.setCaptioningEnabled(captioningEnabled);
 
-        if (!wasPlaying && playing) {
+        if (replay) {
+            // Restoring, not transitioning. The session is activated so that
+            // a playing session is routed media buttons as before, but the
+            // foreground service, notification and wake lock are established
+            // by the next live update through enterPlayingState() (see
+            // playingStateEntered), and the idle/completed transitions are
+            // not re-run: the old instance already ran them.
+            if (playing) {
+                activateMediaSession();
+            }
+            return;
+        }
+
+        if (playing && !playingStateEntered) {
             enterPlayingState();
-        } else if (wasPlaying && !playing) {
+        } else if (!playing && playingStateEntered) {
             exitPlayingState();
         }
 
@@ -755,6 +792,7 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     private void enterPlayingState() {
+        playingStateEntered = true;
         ContextCompat.startForegroundService(this, new Intent(AudioService.this, AudioService.class));
         if (!mediaSession.isActive())
             mediaSession.setActive(true);
@@ -765,6 +803,7 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     private void exitPlayingState() {
+        playingStateEntered = false;
         if (config.androidStopForegroundOnPause) {
             exitForegroundState();
         }
@@ -1207,6 +1246,8 @@ public class AudioService extends MediaBrowserServiceCompat {
         void onPlayMediaItem(MediaMetadataCompat metadata);
         void onTaskRemoved();
         void onClose();
+        /** A service instance was created (see AudioService.onCreate). */
+        void onCreate();
         void onDestroy();
     }
 }
