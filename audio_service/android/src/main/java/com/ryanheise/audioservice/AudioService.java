@@ -24,6 +24,7 @@ import android.support.v4.media.RatingCompat;
 import android.support.v4.media.session.MediaControllerCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
+import android.util.Log;
 import android.util.LruCache;
 import android.util.Size;
 import android.view.KeyEvent;
@@ -44,6 +45,8 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import io.flutter.embedding.engine.FlutterEngine;
 
@@ -104,12 +107,155 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     static AudioService instance;
     private static PendingIntent contentIntent;
+
+    //
+    // ENGINE-SCOPED STATE
+    //
+    // Android starts and destroys this service as clients come and go, but the
+    // AudioHandler that drives it lives in the shared FlutterEngine, which
+    // outlives any single service instance. Everything below therefore belongs
+    // to the engine, not to an instance: it is installed when the plugin
+    // attaches to the engine, replayed onto the MediaSession of whichever
+    // instance is current, and released by release() when the plugin detaches
+    // from the engine. Destroying a service instance must not touch it.
+    //
+
     private static ServiceListener listener;
     private static List<MediaSessionCompat.QueueItem> queue = new ArrayList<>();
     private static final Map<String, MediaMetadataCompat> mediaMetadataCache = new HashMap<>();
+    /** The last state pushed from the engine, or null if none was pushed yet. */
+    private static PlaybackStateUpdate playbackStateUpdate;
+    /** The last playback info pushed from the engine, or null if none was pushed yet. */
+    private static PlaybackInfoUpdate playbackInfoUpdate;
+    /**
+     * Metadata pushed from the engine that no service instance has applied yet,
+     * and whose artwork therefore still needs to be resolved. Cleared by
+     * {@link #applyMetadata} once it has been applied.
+     */
+    private static MediaMetadataCompat pendingMediaMetadata;
+    /** The metadata currently on display, with its artwork already resolved. */
+    private static MediaMetadataCompat mediaMetadata;
+    private static Bitmap artBitmap;
 
     public static void init(ServiceListener listener) {
         AudioService.listener = listener;
+    }
+
+    /**
+     * Releases the state owned by the Flutter engine. Called when the plugin
+     * detaches from the engine hosting the AudioHandler: the handler and
+     * everything it pushed are gone, so a service instance created afterwards
+     * must start from a blank MediaSession rather than adopt stale state.
+     */
+    static synchronized void release() {
+        listener = null;
+        queue = new ArrayList<>();
+        mediaMetadataCache.clear();
+        playbackStateUpdate = null;
+        playbackInfoUpdate = null;
+        pendingMediaMetadata = null;
+        mediaMetadata = null;
+        artBitmap = null;
+    }
+
+    /**
+     * Applies a playback state pushed from the engine, remembering it so that a
+     * service instance created later can adopt it.
+     */
+    static synchronized void updateState(PlaybackStateUpdate update) {
+        playbackStateUpdate = update;
+        final AudioService service = instance;
+        if (service != null) {
+            service.applyState(update, false);
+        }
+    }
+
+    /**
+     * Applies a queue pushed from the engine, remembering it so that a service
+     * instance created later can adopt it.
+     */
+    static synchronized void updateQueue(List<MediaSessionCompat.QueueItem> newQueue) {
+        queue = newQueue;
+        final AudioService service = instance;
+        if (service != null) {
+            service.applyQueue(newQueue);
+        }
+    }
+
+    /**
+     * Applies metadata pushed from the engine, remembering it so that a service
+     * instance created later can adopt it.
+     */
+    static synchronized void updateMetadata(MediaMetadataCompat metadata) {
+        pendingMediaMetadata = metadata;
+        final AudioService service = instance;
+        if (service != null) {
+            service.applyMetadata(metadata);
+        }
+    }
+
+    /**
+     * Applies playback info pushed from the engine, remembering it so that a
+     * service instance created later can adopt it.
+     */
+    static synchronized void updatePlaybackInfo(PlaybackInfoUpdate update) {
+        playbackInfoUpdate = update;
+        final AudioService service = instance;
+        if (service != null) {
+            service.applyPlaybackInfo(update);
+        }
+    }
+
+    /** A playback state pushed from the Flutter engine. */
+    static class PlaybackStateUpdate {
+        final List<MediaControl> controls;
+        final long actionBits;
+        final int[] compactActionIndices;
+        final AudioProcessingState processingState;
+        final boolean playing;
+        final long position;
+        final long bufferedPosition;
+        final float speed;
+        final long updateTime;
+        final Integer errorCode;
+        final String errorMessage;
+        final int repeatMode;
+        final int shuffleMode;
+        final boolean captioningEnabled;
+        final Long queueIndex;
+
+        PlaybackStateUpdate(List<MediaControl> controls, long actionBits, int[] compactActionIndices, AudioProcessingState processingState, boolean playing, long position, long bufferedPosition, float speed, long updateTime, Integer errorCode, String errorMessage, int repeatMode, int shuffleMode, boolean captioningEnabled, Long queueIndex) {
+            this.controls = controls;
+            this.actionBits = actionBits;
+            this.compactActionIndices = compactActionIndices;
+            this.processingState = processingState;
+            this.playing = playing;
+            this.position = position;
+            this.bufferedPosition = bufferedPosition;
+            this.speed = speed;
+            this.updateTime = updateTime;
+            this.errorCode = errorCode;
+            this.errorMessage = errorMessage;
+            this.repeatMode = repeatMode;
+            this.shuffleMode = shuffleMode;
+            this.captioningEnabled = captioningEnabled;
+            this.queueIndex = queueIndex;
+        }
+    }
+
+    /** Playback info pushed from the Flutter engine. */
+    static class PlaybackInfoUpdate {
+        final int playbackType;
+        final Integer volumeControlType;
+        final Integer maxVolume;
+        final Integer volume;
+
+        PlaybackInfoUpdate(int playbackType, Integer volumeControlType, Integer maxVolume, Integer volume) {
+            this.playbackType = playbackType;
+            this.volumeControlType = volumeControlType;
+            this.maxVolume = maxVolume;
+            this.volume = volume;
+        }
     }
 
     public static int toKeyCode(long action) {
@@ -275,8 +421,6 @@ public class AudioService extends MediaBrowserServiceCompat {
     private List<NotificationCompat.Action> nativeActions = new ArrayList<>();
     private List<PlaybackStateCompat.CustomAction> customActions = new ArrayList<>();
     private int[] compactActionIndices;
-    private MediaMetadataCompat mediaMetadata;
-    private Bitmap artBitmap;
     private String notificationChannelId;
     private LruCache<String, Bitmap> artBitmapCache;
     private boolean playing = false;
@@ -350,9 +494,68 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         log("service_engine_request", "serviceGeneration=" + serviceGeneration);
         flutterEngine = AudioServicePlugin.getFlutterEngine(this);
+        // The engine is shared by the whole process and may have outlived a
+        // previous service instance, in which case no onAttachedToEngine()
+        // follows the call above and the plugin has to be reattached to this
+        // instance explicitly.
+        AudioServicePlugin.onServiceCreated(this);
+        restoreEngineState();
         log("service_create_end", "serviceGeneration=" + serviceGeneration
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
                 + " engineHash=" + hashOf(flutterEngine));
+    }
+
+    /**
+     * Adopts the state the Flutter engine last pushed, so that a service
+     * recreated underneath a surviving engine continues from the state the
+     * AudioHandler believes it is in rather than from a blank MediaSession.
+     *
+     * <p>Nothing is restored on a cold start, where the engine was created
+     * along with this service and has not pushed any state yet.
+     */
+    private void restoreEngineState() {
+        final PlaybackStateUpdate state;
+        final PlaybackInfoUpdate playbackInfo;
+        final MediaMetadataCompat pending;
+        final MediaMetadataCompat resolved;
+        synchronized (AudioService.class) {
+            state = playbackStateUpdate;
+            playbackInfo = playbackInfoUpdate;
+            pending = pendingMediaMetadata;
+            resolved = mediaMetadata;
+        }
+        final boolean hasState = state != null && state.processingState != AudioProcessingState.idle;
+        if (!hasState && pending == null && resolved == null && queue.isEmpty()) {
+            return;
+        }
+        log("service_state_restore_begin", "serviceGeneration=" + serviceGeneration
+                + " processingState=" + (state == null ? "none" : state.processingState)
+                + " playing=" + (state != null && state.playing)
+                + " queueSize=" + queue.size());
+        try {
+            if (pending != null) {
+                // Pushed while no instance existed, so its artwork has not been
+                // resolved yet. Resolving reads from disk, so keep it off the
+                // main thread.
+                final ExecutorService executor = Executors.newSingleThreadExecutor();
+                executor.execute(() -> applyMetadata(pending));
+                executor.shutdown();
+            } else if (resolved != null) {
+                mediaSession.setMetadata(resolved);
+            }
+            if (playbackInfo != null) {
+                applyPlaybackInfo(playbackInfo);
+            }
+            if (hasState) {
+                applyState(state, true);
+            }
+        } catch (Exception e) {
+            // Restoring is best effort: a failure here must not take down a
+            // service that Android is in the middle of creating. The next state
+            // pushed from Dart will bring the session up to date.
+            Log.e(AudioServiceLifecycleLog.TAG, "Unable to restore engine state: " + e.getMessage(), e);
+        }
+        log("service_state_restore_end", "serviceGeneration=" + serviceGeneration);
     }
 
     @Override
@@ -377,13 +580,12 @@ public class AudioService extends MediaBrowserServiceCompat {
                 + " engineHash=" + hashOf(flutterEngine));
         super.onDestroy();
         if (listener != null) {
+            // The listener is the engine's AudioHandlerInterface, which
+            // outlives this instance, so it is notified but not cleared here.
+            // AudioServicePlugin clears it via release() when it detaches from
+            // the engine that owns it.
             listener.onDestroy();
-            listener = null;
         }
-        mediaMetadata = null;
-        artBitmap = null;
-        queue.clear();
-        mediaMetadataCache.clear();
         controls.clear();
         artBitmapCache.evictAll();
         compactActionIndices = null;
@@ -537,7 +739,22 @@ public class AudioService extends MediaBrowserServiceCompat {
         return PendingIntent.getBroadcast(this, 0, intent, flags);
     }
 
-    void setState(List<MediaControl> controls, long actionBits, int[] compactActionIndices, AudioProcessingState processingState, boolean playing, long position, long bufferedPosition, float speed, long updateTime, Integer errorCode, String errorMessage, int repeatMode, int shuffleMode, boolean captioningEnabled, Long queueIndex) {
+    /**
+     * Projects a state pushed from the engine onto this instance's
+     * MediaSession.
+     *
+     * @param restoring whether the state is being adopted by a freshly created
+     *     instance rather than arriving from Dart. While restoring, the
+     *     processing state has not actually changed, so the transitions that
+     *     such a change would trigger — stopping the service, leaving the
+     *     foreground, releasing the wake lock — are not run.
+     */
+    private void applyState(PlaybackStateUpdate update, boolean restoring) {
+        if (mediaSession == null) return;
+        final List<MediaControl> controls = update.controls;
+        final int[] compactActionIndices = update.compactActionIndices;
+        final AudioProcessingState processingState = update.processingState;
+        final boolean playing = update.playing;
         boolean notificationChanged = false;
         if (!Arrays.equals(compactActionIndices, this.compactActionIndices)) {
             notificationChanged = true;
@@ -561,24 +778,24 @@ public class AudioService extends MediaBrowserServiceCompat {
         AudioProcessingState oldProcessingState = this.processingState;
         this.processingState = processingState;
         this.playing = playing;
-        this.repeatMode = repeatMode;
-        this.shuffleMode = shuffleMode;
+        this.repeatMode = update.repeatMode;
+        this.shuffleMode = update.shuffleMode;
 
         PlaybackStateCompat.Builder stateBuilder = new PlaybackStateCompat.Builder()
-                .setActions(AUTO_ENABLED_ACTIONS | actionBits)
-                .setState(getPlaybackState(), position, speed, updateTime)
-                .setBufferedPosition(bufferedPosition);
+                .setActions(AUTO_ENABLED_ACTIONS | update.actionBits)
+                .setState(getPlaybackState(), update.position, update.speed, update.updateTime)
+                .setBufferedPosition(update.bufferedPosition);
 
         for (PlaybackStateCompat.CustomAction action : this.customActions) {
             stateBuilder.addCustomAction(action);
         }
 
-        if (queueIndex != null)
-            stateBuilder.setActiveQueueItemId(queueIndex);
-        if (errorCode != null && errorMessage != null)
-            stateBuilder.setErrorMessage(errorCode, errorMessage);
-        else if (errorMessage != null)
-            stateBuilder.setErrorMessage(-987654, errorMessage);
+        if (update.queueIndex != null)
+            stateBuilder.setActiveQueueItemId(update.queueIndex);
+        if (update.errorCode != null && update.errorMessage != null)
+            stateBuilder.setErrorMessage(update.errorCode, update.errorMessage);
+        else if (update.errorMessage != null)
+            stateBuilder.setErrorMessage(-987654, update.errorMessage);
 
         if (mediaMetadata != null) {
             // Update the progress bar in the browse view as content is playing as explained
@@ -589,9 +806,9 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
 
         mediaSession.setPlaybackState(stateBuilder.build());
-        mediaSession.setRepeatMode(repeatMode);
-        mediaSession.setShuffleMode(shuffleMode);
-        mediaSession.setCaptioningEnabled(captioningEnabled);
+        mediaSession.setRepeatMode(update.repeatMode);
+        mediaSession.setShuffleMode(update.shuffleMode);
+        mediaSession.setCaptioningEnabled(update.captioningEnabled);
 
         if (!wasPlaying && playing) {
             enterPlayingState();
@@ -599,8 +816,7 @@ public class AudioService extends MediaBrowserServiceCompat {
             exitPlayingState();
         }
 
-
-        if (oldProcessingState != processingState) {
+        if (!restoring && oldProcessingState != processingState) {
             if (processingState == AudioProcessingState.idle) {
                 legacyStopForeground(true, "processing_state_idle");
                 releaseWakeLock();
@@ -618,7 +834,12 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
     }
 
-    public void setPlaybackInfo(int playbackType, Integer volumeControlType, Integer maxVolume, Integer volume) {
+    private void applyPlaybackInfo(PlaybackInfoUpdate update) {
+        if (mediaSession == null) return;
+        final int playbackType = update.playbackType;
+        final Integer volumeControlType = update.volumeControlType;
+        final Integer maxVolume = update.maxVolume;
+        final Integer volume = update.volume;
         if (playbackType == MediaControllerCompat.PlaybackInfo.PLAYBACK_TYPE_LOCAL) {
             // We have to wait 'til media2 before we can use AudioAttributes.
             mediaSession.setPlaybackToLocal(AudioManager.STREAM_MUSIC);
@@ -811,11 +1032,12 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     /**
-     * Updates queue.
+     * Projects a queue pushed from the engine onto this instance's
+     * MediaSession.
      * Gets called from background thread.
      */
-    synchronized void setQueue(List<MediaSessionCompat.QueueItem> queue) {
-        AudioService.queue = queue;
+    private synchronized void applyQueue(List<MediaSessionCompat.QueueItem> queue) {
+        if (mediaSession == null) return;
         mediaSession.setQueue(queue);
     }
 
@@ -835,7 +1057,9 @@ public class AudioService extends MediaBrowserServiceCompat {
      *  - https://developer.android.com/guide/topics/media-apps/working-with-a-media-session#album_artwork
      *  - https://9to5google.com/2020/08/02/android-11-lockscreen-art/
      */
-    synchronized void setMetadata(MediaMetadataCompat mediaMetadata) {
+    private synchronized void applyMetadata(MediaMetadataCompat mediaMetadata) {
+        if (mediaSession == null) return;
+        final MediaMetadataCompat rawMediaMetadata = mediaMetadata;
         String artCacheFilePath = mediaMetadata.getString("artCacheFile");
         if (artCacheFilePath != null) {
             // Load local files and network images, cached in files
@@ -852,7 +1076,10 @@ public class AudioService extends MediaBrowserServiceCompat {
                 artBitmap = null;
             }
         }
-        this.mediaMetadata = mediaMetadata;
+        AudioService.mediaMetadata = mediaMetadata;
+        if (AudioService.pendingMediaMetadata == rawMediaMetadata) {
+            AudioService.pendingMediaMetadata = null;
+        }
         mediaSession.setMetadata(mediaMetadata);
         handler.removeCallbacksAndMessages(null);
         handler.post(this::updateNotification);
