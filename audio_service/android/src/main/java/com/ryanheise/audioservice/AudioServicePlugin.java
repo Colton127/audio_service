@@ -92,6 +92,9 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
     public static synchronized FlutterEngine getFlutterEngine(Context context) {
         final String requester = requesterOf(context);
+        // Whoever asks for the engine needs it alive, so a disposal deferred
+        // from a previous AudioService.onDestroy() is no longer wanted.
+        cancelFlutterEngineDisposal("engine_requested_by_" + requester);
         FlutterEngine flutterEngine = FlutterEngineCache.getInstance().get(flutterEngineId);
         if (flutterEngine == null) {
             // Bump the generation before the engine is constructed, since the
@@ -183,6 +186,57 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         }
     }
 
+    /**
+     * How long after an AudioService instance is destroyed the shared
+     * FlutterEngine is kept before being disposed. Long enough for a service
+     * (re)creation that the system had already queued to reach onCreate() and
+     * cancel the disposal.
+     */
+    private static final long ENGINE_DISPOSAL_DELAY_MS = 1000;
+    private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static Runnable pendingEngineDisposal;
+
+    /**
+     * Disposes the shared FlutterEngine after {@link #ENGINE_DISPOSAL_DELAY_MS},
+     * unless the engine is requested again (see {@link #getFlutterEngine}) or
+     * an AudioService instance exists by then.
+     * <p>
+     * Disposing synchronously from AudioService.onDestroy() created a
+     * self-sustaining loop whenever the system had already queued the
+     * creation of the next service instance: destroying the engine detached
+     * the plugin, which posted an unbind of the old MediaBrowser, while the
+     * queued onCreate() built a fresh engine whose plugin posted a bind. The
+     * unbind then tore down the new service and the bind created yet another
+     * one, bootstrapping a FlutterEngine on every cycle. Deferring the
+     * disposal lets that queued onCreate() find the engine in the cache and
+     * cancel the disposal, so the cycle never starts.
+     */
+    private static synchronized void scheduleFlutterEngineDisposal() {
+        cancelFlutterEngineDisposal("rescheduled");
+        pendingEngineDisposal = () -> {
+            synchronized (AudioServicePlugin.class) {
+                pendingEngineDisposal = null;
+                if (AudioService.instance != null) {
+                    log("flutter_engine_dispose_skipped", "generation=" + flutterEngineGeneration
+                            + " reason=service_recreated");
+                    return;
+                }
+                disposeFlutterEngine();
+            }
+        };
+        log("flutter_engine_dispose_scheduled", "generation=" + flutterEngineGeneration
+                + " delayMs=" + ENGINE_DISPOSAL_DELAY_MS);
+        mainHandler.postDelayed(pendingEngineDisposal, ENGINE_DISPOSAL_DELAY_MS);
+    }
+
+    private static synchronized void cancelFlutterEngineDisposal(String reason) {
+        if (pendingEngineDisposal == null) return;
+        mainHandler.removeCallbacks(pendingEngineDisposal);
+        pendingEngineDisposal = null;
+        log("flutter_engine_dispose_cancelled", "generation=" + flutterEngineGeneration
+                + " reason=" + reason);
+    }
+
     private static final String CHANNEL_CLIENT = "com.ryanheise.audio_service.client.methods";
     private static final String CHANNEL_HANDLER = "com.ryanheise.audio_service.handler.methods";
 
@@ -269,6 +323,12 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             if (applicationContext == null) return; 
             try {
                 MediaSessionCompat.Token token = mediaBrowser.getSessionToken();
+                // A reconnection (e.g. after the service was recreated and the
+                // browser resumed from onConnectionSuspended) yields a new
+                // session token, so release the controller of the old session.
+                if (mediaController != null) {
+                    mediaController.unregisterCallback(controllerCallback);
+                }
                 mediaController = new MediaControllerCompat(applicationContext, token);
                 Activity activity = mainClientInterface != null ? mainClientInterface.activity : null;
                 if (activity != null) {
@@ -353,6 +413,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 && audioHandlerInterface.messenger == flutterPluginBinding.getBinaryMessenger()) {
             audioHandlerInterface.destroy();
             audioHandlerInterface = null;
+            // The handler interface is owned by the engine, not by an
+            // AudioService instance, so it is unregistered from the service
+            // here rather than in AudioService.onDestroy().
+            AudioService.init(null);
             log("audio_handler_interface_destroyed", "generation=" + flutterEngineGeneration
                     + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
         }
@@ -419,7 +483,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         clientInterface.setContext(flutterPluginBinding.getApplicationContext());
         if (clientInterfaces.size() == 1) {
             // This unbinds from the service allowing AudioService.onDestroy to
-            // happen which in turn allows the FlutterEngine to be destroyed.
+            // happen which in turn schedules the disposal of the FlutterEngine.
             disconnect();
         }
         if (clientInterface == mainClientInterface) {
@@ -904,17 +968,17 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             // Flutter engine, not by this service — destroying the engine here
             // would needlessly kill the ongoing playback (and a later app
             // launch cold-starts from the splash screen even though the
-            // process survived). Keep the engine alive in that case; it is
-            // still disposed in the normal flows, where playback has already
-            // been stopped or paused by the time the service is destroyed.
-            if (AudioService.instance == null || !AudioService.instance.isPlaying()) {
-                log("flutter_engine_dispose_on_service_destroy",
-                        "generation=" + flutterEngineGeneration);
-                disposeFlutterEngine();
-            } else {
+            // process survived). Keep the engine alive in that case.
+            if (AudioService.instance != null && AudioService.instance.isPlaying()) {
                 log("flutter_engine_retained", "generation=" + flutterEngineGeneration
                         + " reason=service_destroyed_while_playing");
+                return;
             }
+            // Otherwise the engine is disposed as before, but deferred rather
+            // than inline: a service instance that the system has already
+            // queued for creation must find the engine in the cache (see
+            // scheduleFlutterEngineDisposal).
+            scheduleFlutterEngineDisposal();
         }
 
         @Override

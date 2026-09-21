@@ -377,8 +377,12 @@ public class AudioService extends MediaBrowserServiceCompat {
                 + " engineHash=" + hashOf(flutterEngine));
         super.onDestroy();
         if (listener != null) {
+            // The listener (the plugin's AudioHandlerInterface) belongs to the
+            // shared FlutterEngine, which outlives this service instance. It
+            // stays registered so that a recreated service keeps dispatching to
+            // the same AudioHandler; the plugin clears it when the engine that
+            // hosts it is detached.
             listener.onDestroy();
-            listener = null;
         }
         mediaMetadata = null;
         artBitmap = null;
