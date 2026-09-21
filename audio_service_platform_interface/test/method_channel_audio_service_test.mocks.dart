@@ -199,6 +199,12 @@ class MockAudioHandlerCallbacks extends _i1.Mock
           returnValue: Future<void>.value(),
           returnValueForMissingStub: Future.value()) as _i3.Future<void>);
   @override
+  _i3.Future<void> resyncPlatformState(
+          _i2.ResyncPlatformStateRequest? request) =>
+      (super.noSuchMethod(Invocation.method(#resyncPlatformState, [request]),
+          returnValue: Future<void>.value(),
+          returnValueForMissingStub: Future.value()) as _i3.Future<void>);
+  @override
   _i3.Future<_i2.GetChildrenResponse> getChildren(
           _i2.GetChildrenRequest? request) =>
       (super.noSuchMethod(Invocation.method(#getChildren, [request]),

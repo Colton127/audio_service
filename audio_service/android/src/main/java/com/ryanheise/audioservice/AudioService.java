@@ -104,10 +104,22 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     static AudioService instance;
     private static PendingIntent contentIntent;
+    /**
+     * The engine-scoped listener. It is owned by the FlutterEngine (installed
+     * from the plugin's onAttachedToEngine and cleared from
+     * onDetachedFromEngine), NOT by this service, so that destroying an
+     * AudioService leaves the handler intact for the next one.
+     */
     private static ServiceListener listener;
     private static List<MediaSessionCompat.QueueItem> queue = new ArrayList<>();
     private static final Map<String, MediaMetadataCompat> mediaMetadataCache = new HashMap<>();
 
+    /**
+     * Installs (or clears, when {@code null}) the engine-scoped listener. This
+     * is called when a FlutterEngine attaches/detaches, and again whenever a
+     * new AudioService is created so that the service reconnects to the
+     * existing handler rather than to a newly created one.
+     */
     public static void init(ServiceListener listener) {
         AudioService.listener = listener;
     }
@@ -122,7 +134,9 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
     }
 
-    MediaMetadataCompat createMediaMetadata(String mediaId, String title, String album, String artist, String genre, Long duration, String artUri, Boolean playable, String displayTitle, String displaySubtitle, String displayDescription, RatingCompat rating, Map<?, ?> extras) {
+    // Static because it only populates the metadata cache and therefore must
+    // keep working while no AudioService instance exists.
+    static MediaMetadataCompat createMediaMetadata(String mediaId, String title, String album, String artist, String genre, Long duration, String artUri, Boolean playable, String displayTitle, String displaySubtitle, String displayDescription, RatingCompat rating, Map<?, ?> extras) {
         MediaMetadataCompat.Builder builder = new MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, mediaId)
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title);
@@ -287,6 +301,12 @@ public class AudioService extends MediaBrowserServiceCompat {
     /** Process-local counter of AudioService instances. Diagnostic only. */
     private static int serviceGenerationCounter;
     private final int serviceGeneration = ++serviceGenerationCounter;
+
+    /** Process-local generation of this AudioService instance. Diagnostic only. */
+    int getServiceGeneration() {
+        return serviceGeneration;
+    }
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private VolumeProviderCompat volumeProvider;
 
@@ -350,6 +370,11 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         log("service_engine_request", "serviceGeneration=" + serviceGeneration);
         flutterEngine = AudioServicePlugin.getFlutterEngine(this);
+        // When the engine was a cache hit, onAttachedToEngine does not run
+        // again, so this hook is what reconnects the surviving
+        // AudioHandlerInterface (and any stale MediaControllerCompat) to this
+        // newly created service, and asks Dart to republish its state.
+        AudioServicePlugin.onServiceCreated(this);
         log("service_create_end", "serviceGeneration=" + serviceGeneration
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
                 + " engineHash=" + hashOf(flutterEngine));
@@ -376,10 +401,10 @@ public class AudioService extends MediaBrowserServiceCompat {
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
                 + " engineHash=" + hashOf(flutterEngine));
         super.onDestroy();
-        if (listener != null) {
-            listener.onDestroy();
-            listener = null;
-        }
+        // Only service-owned resources are released here. The FlutterEngine and
+        // the AudioHandlerInterface are owned by the engine, not by this
+        // service, so they deliberately survive: a recreated AudioService
+        // reconnects to them via AudioServicePlugin.onServiceCreated().
         mediaMetadata = null;
         artBitmap = null;
         queue.clear();
@@ -397,7 +422,10 @@ public class AudioService extends MediaBrowserServiceCompat {
         releaseWakeLock();
         instance = null;
         notificationCreated = false;
-        log("service_destroy_end", "serviceGeneration=" + serviceGeneration);
+        log("service_destroy_end", "serviceGeneration=" + serviceGeneration
+                + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
+                + " engineRetained=true"
+                + " handlerRetained=" + (listener != null));
     }
 
     private void legacyStopForeground(boolean removeNotification, String reason) {
@@ -1203,6 +1231,5 @@ public class AudioService extends MediaBrowserServiceCompat {
         void onPlayMediaItem(MediaMetadataCompat metadata);
         void onTaskRemoved();
         void onClose();
-        void onDestroy();
     }
 }

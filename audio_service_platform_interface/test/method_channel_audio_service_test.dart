@@ -613,6 +613,19 @@ void main() {
       }
     });
 
+    test('resyncPlatformState', () async {
+      const request = ResyncPlatformStateRequest();
+      await handlerChannel.invokeMethod<void>(
+          'resyncPlatformState', request.toMap());
+      final captured = verify(callbacks.resyncPlatformState(captureAny))
+          .captured
+          .first as ResyncPlatformStateRequest;
+      expect(
+        captured.toMap(),
+        equals(request.toMap()),
+      );
+    });
+
     test('getChildren', () async {
       const request = GetChildrenRequest(
         parentMediaId: Stubs.parentMediaId,

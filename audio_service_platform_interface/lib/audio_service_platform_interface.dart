@@ -179,6 +179,19 @@ abstract class AudioHandlerCallbacks {
   /// Handle the notification being clicked (Android).
   Future<void> onNotificationClicked(OnNotificationClickedRequest request);
 
+  /// Handle the platform asking for the current state to be published again
+  /// (Android).
+  ///
+  /// This happens when a new `AudioService` is created under an already
+  /// running engine: the new `MediaSession` starts empty and must be given the
+  /// state that this side of the plugin already holds. Implementations should
+  /// republish their current state rather than restoring any state of their
+  /// own.
+  ///
+  /// This is not abstract so that existing implementations of this class keep
+  /// working unchanged; the default is to do nothing.
+  Future<void> resyncPlatformState(ResyncPlatformStateRequest request) async {}
+
   /// Get the children of a parent media item.
   Future<GetChildrenResponse> getChildren(GetChildrenRequest request);
 
@@ -1196,6 +1209,13 @@ class OnTaskRemovedRequest {
 class OnNotificationDeletedRequest {
   @literal
   const OnNotificationDeletedRequest();
+
+  Map<String, dynamic> toMap() => <String, dynamic>{};
+}
+
+class ResyncPlatformStateRequest {
+  @literal
+  const ResyncPlatformStateRequest();
 
   Map<String, dynamic> toMap() => <String, dynamic>{};
 }

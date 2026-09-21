@@ -1018,83 +1018,173 @@ class AudioService {
     return handler;
   }
 
+  /// The tail of the chain that serialises every publication of state to the
+  /// platform.
+  ///
+  /// Normal stream updates and the resync requested after an Android
+  /// `AudioService` is recreated both go through this chain, so platform
+  /// writes are applied in the order they were issued and a resync can never
+  /// land after — and therefore undo — a newer value.
+  static Future<void> _publishChain = Future<void>.value();
+
+  /// Schedules [publication] to run after all previously scheduled
+  /// publications.
+  ///
+  /// The returned future completes with the error thrown by [publication], if
+  /// any, but the chain itself never breaks. Callers must handle that error
+  /// (typically by adding it to [_asyncError]).
+  static Future<void> _publish(Future<void> Function() publication) {
+    final completer = Completer<void>();
+    _publishChain = _publishChain.then((_) async {
+      try {
+        await publication();
+        completer.complete();
+      } catch (e, stackTrace) {
+        completer.completeError(e, stackTrace);
+      }
+    });
+    return completer.future;
+  }
+
+  /// Identifies the most recent [_sendMediaItem] call so that artwork loaded
+  /// for a superseded media item is never published.
+  static Object? _artFetchOperationId;
+
+  /// Publishes [mediaItem] to the platform, with the already-downloaded
+  /// [artCacheFile] added to its extras.
+  static Future<void> _publishMediaItemWithArt(
+      MediaItem mediaItem, String? artCacheFile) {
+    final extras = mediaItem.extras;
+    final platformMediaItem = mediaItem.copyWith(
+      extras: <String, dynamic>{
+        if (extras != null) ...extras,
+        'artCacheFile': artCacheFile,
+      },
+    );
+    return _publish(() => _platform.setMediaItem(
+        SetMediaItemRequest(mediaItem: platformMediaItem._toMessage())));
+  }
+
+  /// Loads [mediaItem]'s artwork and publishes the item again with it.
+  ///
+  /// [operationId] identifies the [_sendMediaItem] call this belongs to, so
+  /// that artwork arriving for a superseded media item is discarded.
+  static Future<void> _loadAndSendArtwork(
+      MediaItem mediaItem, Object operationId) async {
+    final loadedFilePath = await _loadArtwork(mediaItem);
+    if (operationId != _artFetchOperationId) {
+      return;
+    }
+    // If we successfully downloaded the art, call to platform.
+    if (loadedFilePath != null) {
+      await _publishMediaItemWithArt(mediaItem, loadedFilePath);
+    }
+  }
+
+  /// Publishes [mediaItem] to the platform, fetching its artwork first where
+  /// that is needed.
+  static Future<void> _sendMediaItem(MediaItem mediaItem) async {
+    final operationId = Object();
+    _artFetchOperationId = operationId;
+    final artUri = mediaItem.artUri;
+    if (artUri == null || artUri.scheme == 'content') {
+      return _publish(() => _platform
+          .setMediaItem(SetMediaItemRequest(mediaItem: mediaItem._toMessage())));
+    }
+    if (artUri.scheme == 'file') {
+      return _publishMediaItemWithArt(mediaItem, artUri.toFilePath());
+    }
+    // Try to load a cached file from memory.
+    final fileInfo = await cacheManager.getFileFromMemory(artUri.toString());
+    final filePath = fileInfo?.file.path;
+    if (operationId != _artFetchOperationId) {
+      return;
+    }
+    if (filePath != null) {
+      // If we successfully downloaded the art call to platform.
+      return _publishMediaItemWithArt(mediaItem, filePath);
+    }
+    // We haven't fetched the art yet, so show the metadata now, and again
+    // after we load the art. That second publication is deliberately not
+    // awaited, so that nothing — in particular the playback state sent at the
+    // end of a resync — has to wait for an artwork download.
+    await _publish(() => _platform
+        .setMediaItem(SetMediaItemRequest(mediaItem: mediaItem._toMessage())));
+    if (operationId != _artFetchOperationId) {
+      return;
+    }
+    _loadAndSendArtwork(mediaItem, operationId).catchError(_asyncError.add);
+  }
+
+  /// Publishes [playbackInfo] to the platform.
+  static Future<void> _sendAndroidPlaybackInfo(
+          AndroidPlaybackInfo playbackInfo) =>
+      _publish(() => _platform.setAndroidPlaybackInfo(
+            SetAndroidPlaybackInfoRequest(
+              playbackInfo: playbackInfo._toMessage(),
+            ),
+          ));
+
+  /// Publishes [queue] to the platform.
+  static Future<void> _sendQueue(List<MediaItem> queue) =>
+      _publish(() => _platform.setQueue(SetQueueRequest(
+          queue: queue.map((item) => item._toMessage()).toList())));
+
+  /// Publishes [playbackState] to the platform.
+  static Future<void> _sendPlaybackState(PlaybackState playbackState) =>
+      _publish(() => _platform
+          .setState(SetStateRequest(state: playbackState._toMessage())));
+
+  /// Publishes the current state again, at the platform's request.
+  ///
+  /// Android calls this when a new `AudioService` — and with it a new
+  /// `MediaSession` — is created under an engine that is already running. The
+  /// state held here is the authoritative one, so nothing is restored: the
+  /// current value of each stream is simply published again, through the same
+  /// path as a normal update and without being re-added to the public
+  /// subjects.
+  ///
+  /// Each value is read immediately before it is published, with no suspension
+  /// point in between, so a newer value published by a normal stream update
+  /// can never be overwritten by older data from here.
+  static Future<void> _resyncPlatformState() async {
+    try {
+      final playbackInfo = _handler.androidPlaybackInfo.nvalue;
+      if (playbackInfo != null) {
+        await _sendAndroidPlaybackInfo(playbackInfo);
+      }
+      final queue = _handler.queue.nvalue;
+      if (queue != null) {
+        await _sendQueue(queue);
+      }
+      final mediaItem = _handler.mediaItem.nvalue;
+      if (mediaItem != null) {
+        await _sendMediaItem(mediaItem);
+      }
+      // Sent last: the playback state is what activates the session and
+      // builds the notification, so the rest should already be in place.
+      final playbackState = _handler.playbackState.nvalue;
+      if (playbackState != null) {
+        await _sendPlaybackState(playbackState);
+      }
+    } catch (e) {
+      _asyncError.add(e);
+    }
+  }
+
   static Future<void> _observeMediaItem() async {
-    Object? artFetchOperationId;
-    _handler.mediaItem.listen((mediaItem) async {
+    _handler.mediaItem.listen((mediaItem) {
       if (mediaItem == null) {
         return;
       }
-      final operationId = Object();
-      artFetchOperationId = operationId;
-      final artUri = mediaItem.artUri;
-      if (artUri == null || artUri.scheme == 'content') {
-        _platform
-            .setMediaItem(
-                SetMediaItemRequest(mediaItem: mediaItem._toMessage()))
-            .catchError(_asyncError.add);
-      } else {
-        /// Sends media item to the platform.
-        /// We potentially need to fetch the art before that.
-        Future<void> sendToPlatform(String? filePath) async {
-          final extras = mediaItem.extras;
-          final platformMediaItem = mediaItem.copyWith(
-            extras: <String, dynamic>{
-              if (extras != null) ...extras,
-              'artCacheFile': filePath,
-            },
-          );
-          await _platform.setMediaItem(
-              SetMediaItemRequest(mediaItem: platformMediaItem._toMessage()));
-        }
-
-        if (artUri.scheme == 'file') {
-          sendToPlatform(artUri.toFilePath()).catchError(_asyncError.add);
-        } else {
-          // Try to load a cached file from memory.
-          final fileInfo =
-              await cacheManager.getFileFromMemory(artUri.toString());
-          final filePath = fileInfo?.file.path;
-          if (operationId != artFetchOperationId) {
-            return;
-          }
-
-          if (filePath != null) {
-            // If we successfully downloaded the art call to platform.
-            sendToPlatform(filePath).catchError(_asyncError.add);
-          } else {
-            // We haven't fetched the art yet, so show the metadata now, and again
-            // after we load the art.
-            try {
-              await _platform.setMediaItem(
-                  SetMediaItemRequest(mediaItem: mediaItem._toMessage()));
-            } catch (e) {
-              _asyncError.add(e);
-              return;
-            }
-            if (operationId != artFetchOperationId) {
-              return;
-            }
-            // Load the art.
-            final loadedFilePath = await _loadArtwork(mediaItem);
-            if (operationId != artFetchOperationId) {
-              return;
-            }
-            // If we successfully downloaded the art, call to platform.
-            if (loadedFilePath != null) {
-              sendToPlatform(loadedFilePath).catchError(_asyncError.add);
-            }
-          }
-        }
-      }
+      _sendMediaItem(mediaItem).catchError(_asyncError.add);
     });
   }
 
   static Future<void> _observeAndroidPlaybackInfo() async {
     await for (var playbackInfo in _handler.androidPlaybackInfo) {
       try {
-        await _platform.setAndroidPlaybackInfo(SetAndroidPlaybackInfoRequest(
-          playbackInfo: playbackInfo._toMessage(),
-        ));
+        await _sendAndroidPlaybackInfo(playbackInfo);
       } catch (e) {
         _asyncError.add(e);
       }
@@ -1107,8 +1197,7 @@ class AudioService {
         _loadAllArtwork(queue);
       }
       try {
-        await _platform.setQueue(SetQueueRequest(
-            queue: queue.map((item) => item._toMessage()).toList()));
+        await _sendQueue(queue);
       } catch (e) {
         _asyncError.add(e);
       }
@@ -1119,8 +1208,7 @@ class AudioService {
     var previousState = _handler.playbackState.nvalue;
     await for (var playbackState in _handler.playbackState) {
       try {
-        await _platform
-            .setState(SetStateRequest(state: playbackState._toMessage()));
+        await _sendPlaybackState(playbackState);
         if (playbackState.processingState == AudioProcessingState.idle &&
             previousState?.processingState != AudioProcessingState.idle) {
           await AudioService._stop();
@@ -3897,6 +3985,14 @@ class _HandlerCallbacks extends AudioHandlerCallbacks {
   Future<void> onNotificationDeleted(
           OnNotificationDeletedRequest request) async =>
       (await handlerFuture).onNotificationDeleted();
+
+  @override
+  Future<void> resyncPlatformState(ResyncPlatformStateRequest request) async {
+    // The request can arrive as soon as `configure` has returned, which is
+    // before the handler has been built, so wait for it first.
+    await handlerFuture;
+    await AudioService._resyncPlatformState();
+  }
 
   @override
   Future<void> onTaskRemoved(OnTaskRemovedRequest request) async =>

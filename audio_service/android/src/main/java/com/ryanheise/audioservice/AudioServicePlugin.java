@@ -151,6 +151,14 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         return flutterEngine;
     }
 
+    /**
+     * Destroys the shared FlutterEngine, which in turn detaches the plugin and
+     * destroys the engine-scoped {@link AudioHandlerInterface}.
+     *
+     * <p>This is never triggered by an AudioService being destroyed: the engine
+     * and the handler outlive any number of AudioService instances. Call this
+     * only for an explicit teardown of the audio engine.
+     */
     public static synchronized void disposeFlutterEngine() {
         log("flutter_engine_dispose_requested", "generation=" + flutterEngineGeneration
                 + " engineHash=" + hashOf(FlutterEngineCache.getInstance().get(flutterEngineId)));
@@ -254,6 +262,77 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 //        }
 //    }
 
+    /**
+     * Creates a controller for {@code token} and attaches it to the activity,
+     * if any. Any controller held for a previous session is released first.
+     */
+    private static void attachMediaController(Context context, MediaSessionCompat.Token token) {
+        if (token == null) return;
+        releaseMediaController();
+        mediaController = new MediaControllerCompat(context.getApplicationContext(), token);
+        final Activity activity = mainClientInterface != null ? mainClientInterface.activity : null;
+        if (activity != null) {
+            MediaControllerCompat.setMediaController(activity, mediaController);
+        }
+        mediaController.registerCallback(controllerCallback);
+    }
+
+    /** Drops the controller, detaching it from the activity it was set on. */
+    private static void releaseMediaController() {
+        if (mediaController == null) return;
+        mediaController.unregisterCallback(controllerCallback);
+        mediaController = null;
+        final Activity activity = mainClientInterface != null ? mainClientInterface.activity : null;
+        if (activity != null) {
+            // Don't leave the activity routing volume keys to a dead session.
+            MediaControllerCompat.setMediaController(activity, null);
+        }
+    }
+
+    /**
+     * Reconnects engine-scoped state to a newly created AudioService.
+     *
+     * <p>When the shared FlutterEngine is a cache hit, onAttachedToEngine does
+     * not run again, so this is the only place where the surviving
+     * AudioHandlerInterface is reinstalled into the new service. It is strictly
+     * a reconnection hook: it stores no playback state of its own, and instead
+     * asks Dart — the only authority on playback state — to republish it.
+     */
+    static synchronized void onServiceCreated(AudioService service) {
+        final String fields = "serviceGeneration=" + service.getServiceGeneration()
+                + " engineGeneration=" + flutterEngineGeneration;
+        if (audioHandlerInterface != null) {
+            // Idempotent: reinstalls the existing handler into the new service.
+            AudioService.init(audioHandlerInterface);
+        }
+        // The previous service's session died with it, so any controller still
+        // pointing at it must be rebuilt against the new session token.
+        final MediaSessionCompat.Token token = service.getSessionToken();
+        if (mediaController != null && token != null
+                && !token.equals(mediaController.getSessionToken())) {
+            try {
+                attachMediaController(service, token);
+                log("media_controller_refreshed", fields
+                        + " activityAttached=" + (mainClientInterface != null
+                                && mainClientInterface.activity != null));
+            } catch (Exception e) {
+                Log.e(AudioServiceLifecycleLog.TAG,
+                        "Unable to refresh MediaController: " + e.getMessage(), e);
+            }
+        }
+        if (audioHandlerInterface == null) {
+            log("service_reconnected", fields + " handler=none resync=skipped");
+        } else if (!flutterReady) {
+            // A brand new engine is about to run its Dart entrypoint, which
+            // publishes its initial state on its own. Nothing to resync.
+            log("service_reconnected", fields
+                    + " handler=existing resync=skipped reason=flutter_not_ready");
+        } else {
+            log("service_reconnected", fields + " handler=existing resync=requested");
+            audioHandlerInterface.invokeMethod("resyncPlatformState", mapOf());
+        }
+    }
+
     //
     // INSTANCE FIELDS AND METHODS
     //
@@ -266,15 +345,12 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     private final MediaBrowserCompat.ConnectionCallback connectionCallback = new MediaBrowserCompat.ConnectionCallback() {
         @Override
         public void onConnected() {
-            if (applicationContext == null) return; 
+            if (applicationContext == null) return;
             try {
-                MediaSessionCompat.Token token = mediaBrowser.getSessionToken();
-                mediaController = new MediaControllerCompat(applicationContext, token);
-                Activity activity = mainClientInterface != null ? mainClientInterface.activity : null;
-                if (activity != null) {
-                    MediaControllerCompat.setMediaController(activity, mediaController);
-                }
-                mediaController.registerCallback(controllerCallback);
+                // This also runs when the browser reconnects after the service
+                // was destroyed and recreated, in which case the token below is
+                // the new session's token.
+                attachMediaController(applicationContext, mediaBrowser.getSessionToken());
                 // PlaybackStateCompat state = mediaController.getPlaybackState();
                 // controllerCallback.onPlaybackStateChanged(state);
                 // MediaMetadataCompat metadata = mediaController.getMetadata();
@@ -296,8 +372,15 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
         @Override
         public void onConnectionSuspended() {
-            // TODO: Handle this
-            log("media_browser_connection_suspended", "generation=" + flutterEngineGeneration);
+            // The service (and with it the MediaSession) went away, so the
+            // controller we hold is stale. Drop it rather than leaving callbacks
+            // registered against a dead session. A new controller is created
+            // from the new session token either when the browser reconnects
+            // (onConnected) or when a new AudioService is created
+            // (onServiceCreated).
+            log("media_browser_connection_suspended", "generation=" + flutterEngineGeneration
+                    + " controllerReleased=" + (mediaController != null));
+            releaseMediaController();
         }
 
         @Override
@@ -327,11 +410,17 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             applicationContext = flutterPluginBinding.getApplicationContext();
         }
         if (audioHandlerInterface == null) {
+            // The AudioHandlerInterface is scoped to the FlutterEngine: it is
+            // created here and destroyed in onDetachedFromEngine, so it outlives
+            // any number of AudioService instances.
+            //
             // We don't know yet whether this is the right engine that hosts the AudioHandler,
             // but we need to register a MethodCallHandler now just in case. If we're wrong, we
             // detect and correct this when receiving the "configure" message.
             audioHandlerInterface = new AudioHandlerInterface(flutterPluginBinding.getBinaryMessenger());
             AudioService.init(audioHandlerInterface);
+            log("audio_handler_interface_created", "generation=" + flutterEngineGeneration
+                    + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
         }
         if (mediaBrowser == null) {
             connect();
@@ -350,11 +439,23 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         clientInterface = null;
         applicationContext = null;
         if (audioHandlerInterface != null
-                && audioHandlerInterface.messenger == flutterPluginBinding.getBinaryMessenger()) {
+                && audioHandlerInterface.messenger == binding.getBinaryMessenger()) {
+            // The engine that hosts the AudioHandler is going away, so the
+            // handler goes with it. Any AudioService that outlives the engine
+            // must not keep calling into a dead messenger.
             audioHandlerInterface.destroy();
             audioHandlerInterface = null;
+            AudioService.init(null);
+            flutterReady = false;
             log("audio_handler_interface_destroyed", "generation=" + flutterEngineGeneration
                     + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
+            if (AudioService.instance != null) {
+                // A service without a handler can no longer respond to media
+                // controls, so don't leave one (and its notification) behind.
+                log("service_stopped_on_engine_detach", "generation=" + flutterEngineGeneration
+                        + " serviceGeneration=" + AudioService.instance.getServiceGeneration());
+                AudioService.instance.stop();
+            }
         }
         flutterPluginBinding = null;
     }
@@ -418,8 +519,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         clientInterface.setActivity(null);
         clientInterface.setContext(flutterPluginBinding.getApplicationContext());
         if (clientInterfaces.size() == 1) {
-            // This unbinds from the service allowing AudioService.onDestroy to
-            // happen which in turn allows the FlutterEngine to be destroyed.
+            // This unbinds from the service, allowing AudioService.onDestroy to
+            // happen once nothing else keeps the service alive. The
+            // FlutterEngine and the AudioHandlerInterface survive that, and a
+            // later AudioService reconnects to them.
             disconnect();
         }
         if (clientInterface == mainClientInterface) {
@@ -450,10 +553,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             activity.setIntent(new Intent(Intent.ACTION_MAIN));
         }
 
-        if (mediaController != null) {
-            mediaController.unregisterCallback(controllerCallback);
-            mediaController = null;
-        }
+        releaseMediaController();
         if (mediaBrowser != null) {
             mediaBrowser.disconnect();
             mediaBrowser = null;
@@ -896,28 +996,6 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         }
 
         @Override
-        public void onDestroy() {
-            // The OS may stop the service while audio is still playing, e.g.
-            // battery saver's App Standby restriction ("Stopping service due
-            // to app idle" after ~9 min without user interaction on some
-            // devices). The audio itself is rendered by plugins living in the
-            // Flutter engine, not by this service — destroying the engine here
-            // would needlessly kill the ongoing playback (and a later app
-            // launch cold-starts from the splash screen even though the
-            // process survived). Keep the engine alive in that case; it is
-            // still disposed in the normal flows, where playback has already
-            // been stopped or paused by the time the service is destroyed.
-            if (AudioService.instance == null || !AudioService.instance.isPlaying()) {
-                log("flutter_engine_dispose_on_service_destroy",
-                        "generation=" + flutterEngineGeneration);
-                disposeFlutterEngine();
-            } else {
-                log("flutter_engine_retained", "generation=" + flutterEngineGeneration
-                        + " reason=service_destroyed_while_playing");
-            }
-        }
-
-        @Override
         public void onMethodCall(MethodCall call, Result result) {
             try {
                 Map<?, ?> args = (Map<?, ?>)call.arguments;
@@ -927,7 +1005,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                         try {
                             Map<?, ?> rawMediaItem = (Map<?, ?>)args.get("mediaItem");
                             MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
-                            AudioService.instance.setMetadata(mediaMetadata);
+                            final AudioService service = AudioService.instance;
+                            if (service != null) {
+                                service.setMetadata(mediaMetadata);
+                            }
                             handler.post(() -> result.success(null));
                         } catch (Exception e) {
                             handler.post(() -> {
@@ -942,7 +1023,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                         try {
                             @SuppressWarnings("unchecked") List<Map<?, ?>> rawQueue = (List<Map<?, ?>>) args.get("queue");
                             List<MediaSessionCompat.QueueItem> queue = raw2queue(rawQueue);
-                            AudioService.instance.setQueue(queue);
+                            final AudioService service = AudioService.instance;
+                            if (service != null) {
+                                service.setQueue(queue);
+                            }
                             handler.post(() -> result.success(null));
                         } catch (Exception e) {
                             handler.post(() -> {
@@ -953,6 +1037,14 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                     break;
                 }
                 case "setState": {
+                    final AudioService stateService = AudioService.instance;
+                    if (stateService == null) {
+                        // No service to project this state onto. Dart remains
+                        // authoritative and the state is republished when the
+                        // next AudioService is created.
+                        result.success(null);
+                        break;
+                    }
                     Map<?, ?> stateMap = (Map<?, ?>)args.get("state");
                     AudioProcessingState processingState = AudioProcessingState.values()[(Integer)stateMap.get("processingState")];
                     boolean playing = (Boolean)stateMap.get("playing");
@@ -1000,7 +1092,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                         for (int i = 0; i < compactActionIndices.length; i++)
                             compactActionIndices[i] = (Integer)compactActionIndexList.get(i);
                     }
-                    AudioService.instance.setState(
+                    stateService.setState(
                             actions,
                             actionBits,
                             compactActionIndices,
@@ -1020,19 +1112,29 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                     break;
                 }
                 case "setAndroidPlaybackInfo": {
+                    final AudioService playbackInfoService = AudioService.instance;
+                    if (playbackInfoService == null) {
+                        result.success(null);
+                        break;
+                    }
                     Map<?, ?> playbackInfo = (Map<?, ?>)args.get("playbackInfo");
                     final int playbackType = (Integer)playbackInfo.get("playbackType");
                     final Integer volumeControlType = (Integer)playbackInfo.get("volumeControlType");
                     final Integer maxVolume = (Integer)playbackInfo.get("maxVolume");
                     final Integer volume = (Integer)playbackInfo.get("volume");
-                    AudioService.instance.setPlaybackInfo(playbackType, volumeControlType, maxVolume, volume);
+                    playbackInfoService.setPlaybackInfo(playbackType, volumeControlType, maxVolume, volume);
                     result.success(null);
                     break;
                 }
                 case "notifyChildrenChanged": {
+                    final AudioService childrenService = AudioService.instance;
+                    if (childrenService == null) {
+                        result.success(null);
+                        break;
+                    }
                     String parentMediaId = (String)args.get("parentMediaId");
                     Map<?, ?> options = (Map<?, ?>)args.get("options");
-                    AudioService.instance.notifyChildrenChanged(parentMediaId, mapToBundle(options));
+                    childrenService.notifyChildrenChanged(parentMediaId, mapToBundle(options));
                     result.success(null);
                     break;
                 }
@@ -1218,7 +1320,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
     private static MediaMetadataCompat createMediaMetadata(Map<?, ?> rawMediaItem) {
        //noinspection unchecked
-       return AudioService.instance.createMediaMetadata(
+       return AudioService.createMediaMetadata(
                 (String)rawMediaItem.get("id"),
                 (String)rawMediaItem.get("title"),
                 (String)rawMediaItem.get("album"),
