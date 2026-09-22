@@ -118,9 +118,9 @@ public class ServiceRecreationTest {
     public void recreatedServiceReusesEngineAndRestoresState() throws Exception {
         ActivityScenario<AudioServiceActivity> scenario = ActivityScenario.launch(AudioServiceActivity.class);
         {
-            // The example's handler publishes its media item once
+            // The harness handler publishes its media item once
             // AudioService.init completes; its artwork arrives a little later
-            // once downloaded and cached.
+            // once loaded from its local file.
             Snapshot before = Snapshot.connect(context, main);
             before.awaitTitle(60_000);
             before.awaitArt(20_000);
@@ -284,8 +284,10 @@ public class ServiceRecreationTest {
 
         void read() throws Exception {
             runOnMain(() -> {
-                title = currentTitle();
-                hasArt = currentHasArt();
+                // Already on main: calling currentTitle()/currentHasArt()
+                // here would post to main and wait on itself.
+                title = titleOnMain();
+                hasArt = hasArtOnMain();
                 List<?> queue = controller.getQueue();
                 queueSize = queue == null ? 0 : queue.size();
                 PlaybackStateCompat state = controller.getPlaybackState();
@@ -301,19 +303,23 @@ public class ServiceRecreationTest {
         }
 
         private String currentTitle() throws Exception {
-            return runOnMain(() -> {
-                MediaMetadataCompat metadata = controller.getMetadata();
-                CharSequence t = metadata == null ? null : metadata.getDescription().getTitle();
-                return t == null ? null : t.toString();
-            });
+            return runOnMain(this::titleOnMain);
         }
 
         private boolean currentHasArt() throws Exception {
-            return runOnMain(() -> {
-                MediaMetadataCompat metadata = controller.getMetadata();
-                Bitmap bitmap = metadata == null ? null : metadata.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART);
-                return bitmap != null;
-            });
+            return runOnMain(this::hasArtOnMain);
+        }
+
+        private String titleOnMain() {
+            MediaMetadataCompat metadata = controller.getMetadata();
+            CharSequence t = metadata == null ? null : metadata.getDescription().getTitle();
+            return t == null ? null : t.toString();
+        }
+
+        private boolean hasArtOnMain() {
+            MediaMetadataCompat metadata = controller.getMetadata();
+            Bitmap bitmap = metadata == null ? null : metadata.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART);
+            return bitmap != null;
         }
 
         private <T> T runOnMain(Callable<T> callable) throws Exception {
