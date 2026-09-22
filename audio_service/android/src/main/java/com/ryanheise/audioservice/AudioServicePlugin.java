@@ -92,6 +92,9 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
     public static synchronized FlutterEngine getFlutterEngine(Context context) {
         final String requester = requesterOf(context);
+        // Whoever asks for the engine needs it alive, so a disposal deferred
+        // from a previous AudioService.onDestroy() is no longer wanted.
+        cancelFlutterEngineDisposal("engine_requested_by_" + requester);
         FlutterEngine flutterEngine = FlutterEngineCache.getInstance().get(flutterEngineId);
         if (flutterEngine == null) {
             // Bump the generation before the engine is constructed, since the
@@ -183,6 +186,57 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         }
     }
 
+    /**
+     * How long after an AudioService instance is destroyed the shared
+     * FlutterEngine is kept before being disposed. Long enough for a service
+     * (re)creation that the system had already queued to reach onCreate() and
+     * cancel the disposal.
+     */
+    private static final long ENGINE_DISPOSAL_DELAY_MS = 1000;
+    private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static Runnable pendingEngineDisposal;
+
+    /**
+     * Disposes the shared FlutterEngine after {@link #ENGINE_DISPOSAL_DELAY_MS},
+     * unless the engine is requested again (see {@link #getFlutterEngine}) or
+     * an AudioService instance exists by then.
+     * <p>
+     * Disposing synchronously from AudioService.onDestroy() created a
+     * self-sustaining loop whenever the system had already queued the
+     * creation of the next service instance: destroying the engine detached
+     * the plugin, which posted an unbind of the old MediaBrowser, while the
+     * queued onCreate() built a fresh engine whose plugin posted a bind. The
+     * unbind then tore down the new service and the bind created yet another
+     * one, bootstrapping a FlutterEngine on every cycle. Deferring the
+     * disposal lets that queued onCreate() find the engine in the cache and
+     * cancel the disposal, so the cycle never starts.
+     */
+    private static synchronized void scheduleFlutterEngineDisposal() {
+        cancelFlutterEngineDisposal("rescheduled");
+        pendingEngineDisposal = () -> {
+            synchronized (AudioServicePlugin.class) {
+                pendingEngineDisposal = null;
+                if (AudioService.instance != null) {
+                    log("flutter_engine_dispose_skipped", "generation=" + flutterEngineGeneration
+                            + " reason=service_recreated");
+                    return;
+                }
+                disposeFlutterEngine();
+            }
+        };
+        log("flutter_engine_dispose_scheduled", "generation=" + flutterEngineGeneration
+                + " delayMs=" + ENGINE_DISPOSAL_DELAY_MS);
+        mainHandler.postDelayed(pendingEngineDisposal, ENGINE_DISPOSAL_DELAY_MS);
+    }
+
+    private static synchronized void cancelFlutterEngineDisposal(String reason) {
+        if (pendingEngineDisposal == null) return;
+        mainHandler.removeCallbacks(pendingEngineDisposal);
+        pendingEngineDisposal = null;
+        log("flutter_engine_dispose_cancelled", "generation=" + flutterEngineGeneration
+                + " reason=" + reason);
+    }
+
     private static final String CHANNEL_CLIENT = "com.ryanheise.audio_service.client.methods";
     private static final String CHANNEL_HANDLER = "com.ryanheise.audio_service.handler.methods";
 
@@ -266,9 +320,19 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     private final MediaBrowserCompat.ConnectionCallback connectionCallback = new MediaBrowserCompat.ConnectionCallback() {
         @Override
         public void onConnected() {
+            log("media_browser_connected", "generation=" + flutterEngineGeneration
+                    + " browserHash=" + hashOf(mediaBrowser)
+                    + " serviceGeneration=" + serviceGenerationOrNone()
+                    + " pluginDetached=" + (applicationContext == null));
             if (applicationContext == null) return; 
             try {
                 MediaSessionCompat.Token token = mediaBrowser.getSessionToken();
+                // A reconnection (e.g. after the service was recreated and the
+                // browser resumed from onConnectionSuspended) yields a new
+                // session token, so release the controller of the old session.
+                if (mediaController != null) {
+                    mediaController.unregisterCallback(controllerCallback);
+                }
                 mediaController = new MediaControllerCompat(applicationContext, token);
                 Activity activity = mainClientInterface != null ? mainClientInterface.activity : null;
                 if (activity != null) {
@@ -302,6 +366,9 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
         @Override
         public void onConnectionFailed() {
+            log("media_browser_connection_failed", "generation=" + flutterEngineGeneration
+                    + " browserHash=" + hashOf(mediaBrowser)
+                    + " serviceGeneration=" + serviceGenerationOrNone());
             if (configureResult != null) {
                 configureResult.error("Unable to bind to AudioService. Please ensure you have declared a <service> element as described in the README.", null, null);
             } else {
@@ -334,7 +401,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             AudioService.init(audioHandlerInterface);
         }
         if (mediaBrowser == null) {
-            connect();
+            connect("engine_attached");
         }
     }
 
@@ -343,7 +410,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         log("plugin_detached_from_engine", "generation=" + flutterEngineGeneration
                 + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
         if (clientInterfaces.size() == 1) {
-            disconnect();
+            disconnect("engine_detached");
         }
         clientInterfaces.remove(clientInterface);
         clientInterface.setContext(null);
@@ -353,6 +420,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 && audioHandlerInterface.messenger == flutterPluginBinding.getBinaryMessenger()) {
             audioHandlerInterface.destroy();
             audioHandlerInterface = null;
+            // The handler interface is owned by the engine, not by an
+            // AudioService instance, so it is unregistered from the service
+            // here rather than in AudioService.onDestroy().
+            AudioService.init(null);
             log("audio_handler_interface_destroyed", "generation=" + flutterEngineGeneration
                     + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
         }
@@ -378,7 +449,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             MediaControllerCompat.setMediaController(mainClientInterface.activity, mediaController);
         }
         if (mediaBrowser == null) {
-            connect();
+            connect("activity_attached");
         }
 
         Activity activity = mainClientInterface.activity;
@@ -419,12 +490,18 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         clientInterface.setContext(flutterPluginBinding.getApplicationContext());
         if (clientInterfaces.size() == 1) {
             // This unbinds from the service allowing AudioService.onDestroy to
-            // happen which in turn allows the FlutterEngine to be destroyed.
-            disconnect();
+            // happen which in turn schedules the disposal of the FlutterEngine.
+            disconnect("activity_detached");
         }
         if (clientInterface == mainClientInterface) {
             mainClientInterface = null;
         }
+    }
+
+    /** Generation of the live AudioService instance, or {@code none}. */
+    private static String serviceGenerationOrNone() {
+        final AudioService service = AudioService.instance;
+        return service == null ? "none" : String.valueOf(service.getServiceGeneration());
     }
 
     private static void logActivityEvent(String event, Activity activity) {
@@ -433,17 +510,37 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 + " activityHash=" + hashOf(activity));
     }
 
-    private void connect() {
+    /**
+     * Connects the shared MediaBrowser to AudioService. The bind itself is
+     * posted to the main looper by the framework, so it happens after this
+     * returns; {@code media_browser_connected} marks its completion.
+     */
+    private void connect(String reason) {
         if (mediaBrowser == null) {
             mediaBrowser = new MediaBrowserCompat(applicationContext,
                     new ComponentName(applicationContext, AudioService.class),
                     connectionCallback,
                     null);
+            log("media_browser_connect_requested", "generation=" + flutterEngineGeneration
+                    + " reason=" + reason
+                    + " browserHash=" + hashOf(mediaBrowser)
+                    + " messengerHash=" + hashOf(flutterPluginBinding != null ? flutterPluginBinding.getBinaryMessenger() : null)
+                    + " serviceGeneration=" + serviceGenerationOrNone());
             mediaBrowser.connect();
         }
     }
 
-    private void disconnect() {
+    /**
+     * Disconnects the shared MediaBrowser. Like the bind, the unbind is posted
+     * to the main looper, so it reaches the service after this returns.
+     */
+    private void disconnect(String reason) {
+        log("media_browser_disconnect_requested", "generation=" + flutterEngineGeneration
+                + " reason=" + reason
+                + " browserHash=" + hashOf(mediaBrowser)
+                + " browserConnected=" + (mediaBrowser != null && mediaBrowser.isConnected())
+                + " messengerHash=" + hashOf(flutterPluginBinding != null ? flutterPluginBinding.getBinaryMessenger() : null)
+                + " serviceGeneration=" + serviceGenerationOrNone());
         Activity activity = mainClientInterface != null ? mainClientInterface.activity : null;
         if (activity != null) {
             // Since the activity enters paused state, we set the intent with ACTION_MAIN.
@@ -895,6 +992,49 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             invokeMethod("onNotificationDeleted", mapOf());
         }
 
+        // The last values projected from the Dart AudioHandler. They are kept
+        // on this object, which lives as long as the engine, so that an
+        // AudioService instance created while the engine survived can be
+        // brought back to the handler's current state (see onCreate).
+        private Map<?, ?> lastStateArgs;
+        private Map<?, ?> lastMediaItemArgs;
+        private Map<?, ?> lastQueueArgs;
+        private Map<?, ?> lastPlaybackInfoArgs;
+
+        @Override
+        public void onCreate() {
+            // A new AudioService instance starts with an empty MediaSession
+            // while the Dart handler's streams still hold the current state
+            // and will not re-emit it. Re-project the last known values,
+            // exactly once, through the same paths as the live updates, but
+            // as a replay: no transition-specific side effects.
+            if (lastStateArgs == null && lastMediaItemArgs == null
+                    && lastQueueArgs == null && lastPlaybackInfoArgs == null) {
+                return;
+            }
+            log("service_state_replay", "generation=" + flutterEngineGeneration
+                    + " state=" + (lastStateArgs != null)
+                    + " mediaItem=" + (lastMediaItemArgs != null)
+                    + " queue=" + (lastQueueArgs != null)
+                    + " playbackInfo=" + (lastPlaybackInfoArgs != null));
+            try {
+                if (lastPlaybackInfoArgs != null) {
+                    applyPlaybackInfo(lastPlaybackInfoArgs);
+                }
+                if (lastStateArgs != null) {
+                    applyState(lastStateArgs, true);
+                }
+            } catch (Exception e) {
+                Log.e(AudioServiceLifecycleLog.TAG, "state replay failed: " + e.getMessage(), e);
+            }
+            if (lastMediaItemArgs != null) {
+                applyMediaItem(lastMediaItemArgs, null);
+            }
+            if (lastQueueArgs != null) {
+                applyQueue(lastQueueArgs, null);
+            }
+        }
+
         @Override
         public void onDestroy() {
             // The OS may stop the service while audio is still playing, e.g.
@@ -904,17 +1044,17 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             // Flutter engine, not by this service — destroying the engine here
             // would needlessly kill the ongoing playback (and a later app
             // launch cold-starts from the splash screen even though the
-            // process survived). Keep the engine alive in that case; it is
-            // still disposed in the normal flows, where playback has already
-            // been stopped or paused by the time the service is destroyed.
-            if (AudioService.instance == null || !AudioService.instance.isPlaying()) {
-                log("flutter_engine_dispose_on_service_destroy",
-                        "generation=" + flutterEngineGeneration);
-                disposeFlutterEngine();
-            } else {
+            // process survived). Keep the engine alive in that case.
+            if (AudioService.instance != null && AudioService.instance.isPlaying()) {
                 log("flutter_engine_retained", "generation=" + flutterEngineGeneration
                         + " reason=service_destroyed_while_playing");
+                return;
             }
+            // Otherwise the engine is disposed as before, but deferred rather
+            // than inline: a service instance that the system has already
+            // queued for creation must find the engine in the cache (see
+            // scheduleFlutterEngineDisposal).
+            scheduleFlutterEngineDisposal();
         }
 
         @Override
@@ -923,109 +1063,24 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 Map<?, ?> args = (Map<?, ?>)call.arguments;
                 switch (call.method) {
                 case "setMediaItem": {
-                    Executors.newSingleThreadExecutor().execute(() -> {
-                        try {
-                            Map<?, ?> rawMediaItem = (Map<?, ?>)args.get("mediaItem");
-                            MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
-                            AudioService.instance.setMetadata(mediaMetadata);
-                            handler.post(() -> result.success(null));
-                        } catch (Exception e) {
-                            handler.post(() -> {
-                                result.error("UNEXPECTED_ERROR", "Unexpected error", Log.getStackTraceString(e));
-                            });
-                        }
-                    });
+                    lastMediaItemArgs = args;
+                    applyMediaItem(args, result);
                     break;
                 }
                 case "setQueue": {
-                    Executors.newSingleThreadExecutor().execute(() -> {
-                        try {
-                            @SuppressWarnings("unchecked") List<Map<?, ?>> rawQueue = (List<Map<?, ?>>) args.get("queue");
-                            List<MediaSessionCompat.QueueItem> queue = raw2queue(rawQueue);
-                            AudioService.instance.setQueue(queue);
-                            handler.post(() -> result.success(null));
-                        } catch (Exception e) {
-                            handler.post(() -> {
-                                result.error("UNEXPECTED_ERROR", "Unexpected error", Log.getStackTraceString(e));
-                            });
-                        }
-                    });
+                    lastQueueArgs = args;
+                    applyQueue(args, result);
                     break;
                 }
                 case "setState": {
-                    Map<?, ?> stateMap = (Map<?, ?>)args.get("state");
-                    AudioProcessingState processingState = AudioProcessingState.values()[(Integer)stateMap.get("processingState")];
-                    boolean playing = (Boolean)stateMap.get("playing");
-                    @SuppressWarnings("unchecked") List<Map<?, ?>> rawControls = (List<Map<?, ?>>)stateMap.get("controls");
-                    @SuppressWarnings("unchecked") List<Object> compactActionIndexList = (List<Object>)stateMap.get("androidCompactActionIndices");
-                    @SuppressWarnings("unchecked") List<Integer> rawSystemActions = (List<Integer>)stateMap.get("systemActions");
-                    long position = getLong(stateMap.get("updatePosition"));
-                    long bufferedPosition = getLong(stateMap.get("bufferedPosition"));
-                    float speed = (float)((double)((Double)stateMap.get("speed")));
-                    long updateTimeSinceEpoch = stateMap.get("updateTime") == null ? System.currentTimeMillis() : getLong(stateMap.get("updateTime"));
-                    Integer errorCode = (Integer)stateMap.get("errorCode");
-                    String errorMessage = (String)stateMap.get("errorMessage");
-                    int repeatMode = (Integer)stateMap.get("repeatMode");
-                    int shuffleMode = (Integer)stateMap.get("shuffleMode");
-                    Long queueIndex = getLong(stateMap.get("queueIndex"));
-                    boolean captioningEnabled = (Boolean)stateMap.get("captioningEnabled");
-
-                    // On the flutter side, we represent the update time relative to the epoch.
-                    // On the native side, we must represent the update time relative to the boot time.
-                    long updateTimeSinceBoot = updateTimeSinceEpoch - bootTime;
-
-                    List<MediaControl> actions = new ArrayList<>();
-                    long actionBits = 0;
-                    for (Map<?, ?> rawControl : rawControls) {
-                        String resource = (String)rawControl.get("androidIcon");
-                        String label = (String)rawControl.get("label");
-                        long actionCode = 1 << ((Integer)rawControl.get("action"));
-                        actionBits |= actionCode;
-                        Map<?, ?> customActionMap = (Map<?, ?>)rawControl.get("customAction");
-                        CustomMediaAction customAction = null;
-                        if (customActionMap != null) {
-                            String name = (String) customActionMap.get("name");
-                            Map<?, ?> extras = (Map<?, ?>) customActionMap.get("extras");
-                            customAction = new CustomMediaAction(name, extras);
-                        }
-                        actions.add(new MediaControl(resource, label, actionCode, customAction));
-                    }
-                    for (Integer rawSystemAction : rawSystemActions) {
-                        long actionCode = 1 << rawSystemAction;
-                        actionBits |= actionCode;
-                    }
-                    int[] compactActionIndices = null;
-                    if (compactActionIndexList != null) {
-                        compactActionIndices = new int[Math.min(AudioService.MAX_COMPACT_ACTIONS, compactActionIndexList.size())];
-                        for (int i = 0; i < compactActionIndices.length; i++)
-                            compactActionIndices[i] = (Integer)compactActionIndexList.get(i);
-                    }
-                    AudioService.instance.setState(
-                            actions,
-                            actionBits,
-                            compactActionIndices,
-                            processingState,
-                            playing,
-                            position,
-                            bufferedPosition,
-                            speed,
-                            updateTimeSinceBoot,
-                            errorCode,
-                            errorMessage,
-                            repeatMode,
-                            shuffleMode,
-                            captioningEnabled,
-                            queueIndex);
+                    lastStateArgs = args;
+                    applyState(args, false);
                     result.success(null);
                     break;
                 }
                 case "setAndroidPlaybackInfo": {
-                    Map<?, ?> playbackInfo = (Map<?, ?>)args.get("playbackInfo");
-                    final int playbackType = (Integer)playbackInfo.get("playbackType");
-                    final Integer volumeControlType = (Integer)playbackInfo.get("volumeControlType");
-                    final Integer maxVolume = (Integer)playbackInfo.get("maxVolume");
-                    final Integer volume = (Integer)playbackInfo.get("volume");
-                    AudioService.instance.setPlaybackInfo(playbackType, volumeControlType, maxVolume, volume);
+                    lastPlaybackInfoArgs = args;
+                    applyPlaybackInfo(args);
                     result.success(null);
                     break;
                 }
@@ -1087,6 +1142,129 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 e.printStackTrace();
                 result.error(e.getMessage(), null, null);
             }
+        }
+
+
+        /** Projects a media item; {@code result} is null when replaying. */
+        private void applyMediaItem(Map<?, ?> args, final Result result) {
+            Executors.newSingleThreadExecutor().execute(() -> {
+                try {
+                    Map<?, ?> rawMediaItem = (Map<?, ?>)args.get("mediaItem");
+                    MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
+                    AudioService.instance.setMetadata(mediaMetadata);
+                    if (result != null) {
+                        handler.post(() -> result.success(null));
+                    }
+                } catch (Exception e) {
+                    if (result != null) {
+                        handler.post(() -> {
+                            result.error("UNEXPECTED_ERROR", "Unexpected error", Log.getStackTraceString(e));
+                        });
+                    } else {
+                        Log.e(AudioServiceLifecycleLog.TAG, "media item replay failed: " + e.getMessage(), e);
+                    }
+                }
+            });
+        }
+
+        /** Projects the queue; {@code result} is null when replaying. */
+        private void applyQueue(Map<?, ?> args, final Result result) {
+            Executors.newSingleThreadExecutor().execute(() -> {
+                try {
+                    @SuppressWarnings("unchecked") List<Map<?, ?>> rawQueue = (List<Map<?, ?>>) args.get("queue");
+                    List<MediaSessionCompat.QueueItem> queue = raw2queue(rawQueue);
+                    AudioService.instance.setQueue(queue);
+                    if (result != null) {
+                        handler.post(() -> result.success(null));
+                    }
+                } catch (Exception e) {
+                    if (result != null) {
+                        handler.post(() -> {
+                            result.error("UNEXPECTED_ERROR", "Unexpected error", Log.getStackTraceString(e));
+                        });
+                    } else {
+                        Log.e(AudioServiceLifecycleLog.TAG, "queue replay failed: " + e.getMessage(), e);
+                    }
+                }
+            });
+        }
+
+        /** Projects a playback state; see AudioService.setState for {@code replay}. */
+        private void applyState(Map<?, ?> args, boolean replay) {
+            Map<?, ?> stateMap = (Map<?, ?>)args.get("state");
+            AudioProcessingState processingState = AudioProcessingState.values()[(Integer)stateMap.get("processingState")];
+            boolean playing = (Boolean)stateMap.get("playing");
+            @SuppressWarnings("unchecked") List<Map<?, ?>> rawControls = (List<Map<?, ?>>)stateMap.get("controls");
+            @SuppressWarnings("unchecked") List<Object> compactActionIndexList = (List<Object>)stateMap.get("androidCompactActionIndices");
+            @SuppressWarnings("unchecked") List<Integer> rawSystemActions = (List<Integer>)stateMap.get("systemActions");
+            long position = getLong(stateMap.get("updatePosition"));
+            long bufferedPosition = getLong(stateMap.get("bufferedPosition"));
+            float speed = (float)((double)((Double)stateMap.get("speed")));
+            long updateTimeSinceEpoch = stateMap.get("updateTime") == null ? System.currentTimeMillis() : getLong(stateMap.get("updateTime"));
+            Integer errorCode = (Integer)stateMap.get("errorCode");
+            String errorMessage = (String)stateMap.get("errorMessage");
+            int repeatMode = (Integer)stateMap.get("repeatMode");
+            int shuffleMode = (Integer)stateMap.get("shuffleMode");
+            Long queueIndex = getLong(stateMap.get("queueIndex"));
+            boolean captioningEnabled = (Boolean)stateMap.get("captioningEnabled");
+
+            // On the flutter side, we represent the update time relative to the epoch.
+            // On the native side, we must represent the update time relative to the boot time.
+            long updateTimeSinceBoot = updateTimeSinceEpoch - bootTime;
+
+            List<MediaControl> actions = new ArrayList<>();
+            long actionBits = 0;
+            for (Map<?, ?> rawControl : rawControls) {
+                String resource = (String)rawControl.get("androidIcon");
+                String label = (String)rawControl.get("label");
+                long actionCode = 1 << ((Integer)rawControl.get("action"));
+                actionBits |= actionCode;
+                Map<?, ?> customActionMap = (Map<?, ?>)rawControl.get("customAction");
+                CustomMediaAction customAction = null;
+                if (customActionMap != null) {
+                    String name = (String) customActionMap.get("name");
+                    Map<?, ?> extras = (Map<?, ?>) customActionMap.get("extras");
+                    customAction = new CustomMediaAction(name, extras);
+                }
+                actions.add(new MediaControl(resource, label, actionCode, customAction));
+            }
+            for (Integer rawSystemAction : rawSystemActions) {
+                long actionCode = 1 << rawSystemAction;
+                actionBits |= actionCode;
+            }
+            int[] compactActionIndices = null;
+            if (compactActionIndexList != null) {
+                compactActionIndices = new int[Math.min(AudioService.MAX_COMPACT_ACTIONS, compactActionIndexList.size())];
+                for (int i = 0; i < compactActionIndices.length; i++)
+                    compactActionIndices[i] = (Integer)compactActionIndexList.get(i);
+            }
+            AudioService.instance.setState(
+                    actions,
+                    actionBits,
+                    compactActionIndices,
+                    processingState,
+                    playing,
+                    position,
+                    bufferedPosition,
+                    speed,
+                    updateTimeSinceBoot,
+                    errorCode,
+                    errorMessage,
+                    repeatMode,
+                    shuffleMode,
+                    captioningEnabled,
+                    queueIndex,
+                    replay);
+        }
+
+        /** Projects the Android playback info (local/remote volume handling). */
+        private void applyPlaybackInfo(Map<?, ?> args) {
+            Map<?, ?> playbackInfo = (Map<?, ?>)args.get("playbackInfo");
+            final int playbackType = (Integer)playbackInfo.get("playbackType");
+            final Integer volumeControlType = (Integer)playbackInfo.get("volumeControlType");
+            final Integer maxVolume = (Integer)playbackInfo.get("maxVolume");
+            final Integer volume = (Integer)playbackInfo.get("volume");
+            AudioService.instance.setPlaybackInfo(playbackType, volumeControlType, maxVolume, volume);
         }
 
         @UiThread
