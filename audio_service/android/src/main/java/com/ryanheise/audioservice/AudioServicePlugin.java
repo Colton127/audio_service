@@ -320,6 +320,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     private final MediaBrowserCompat.ConnectionCallback connectionCallback = new MediaBrowserCompat.ConnectionCallback() {
         @Override
         public void onConnected() {
+            log("media_browser_connected", "generation=" + flutterEngineGeneration
+                    + " browserHash=" + hashOf(mediaBrowser)
+                    + " serviceGeneration=" + serviceGenerationOrNone()
+                    + " pluginDetached=" + (applicationContext == null));
             if (applicationContext == null) return; 
             try {
                 MediaSessionCompat.Token token = mediaBrowser.getSessionToken();
@@ -362,6 +366,9 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
         @Override
         public void onConnectionFailed() {
+            log("media_browser_connection_failed", "generation=" + flutterEngineGeneration
+                    + " browserHash=" + hashOf(mediaBrowser)
+                    + " serviceGeneration=" + serviceGenerationOrNone());
             if (configureResult != null) {
                 configureResult.error("Unable to bind to AudioService. Please ensure you have declared a <service> element as described in the README.", null, null);
             } else {
@@ -394,7 +401,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             AudioService.init(audioHandlerInterface);
         }
         if (mediaBrowser == null) {
-            connect();
+            connect("engine_attached");
         }
     }
 
@@ -403,7 +410,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         log("plugin_detached_from_engine", "generation=" + flutterEngineGeneration
                 + " messengerHash=" + hashOf(binding.getBinaryMessenger()));
         if (clientInterfaces.size() == 1) {
-            disconnect();
+            disconnect("engine_detached");
         }
         clientInterfaces.remove(clientInterface);
         clientInterface.setContext(null);
@@ -442,7 +449,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
             MediaControllerCompat.setMediaController(mainClientInterface.activity, mediaController);
         }
         if (mediaBrowser == null) {
-            connect();
+            connect("activity_attached");
         }
 
         Activity activity = mainClientInterface.activity;
@@ -484,11 +491,17 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         if (clientInterfaces.size() == 1) {
             // This unbinds from the service allowing AudioService.onDestroy to
             // happen which in turn schedules the disposal of the FlutterEngine.
-            disconnect();
+            disconnect("activity_detached");
         }
         if (clientInterface == mainClientInterface) {
             mainClientInterface = null;
         }
+    }
+
+    /** Generation of the live AudioService instance, or {@code none}. */
+    private static String serviceGenerationOrNone() {
+        final AudioService service = AudioService.instance;
+        return service == null ? "none" : String.valueOf(service.getServiceGeneration());
     }
 
     private static void logActivityEvent(String event, Activity activity) {
@@ -497,17 +510,37 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 + " activityHash=" + hashOf(activity));
     }
 
-    private void connect() {
+    /**
+     * Connects the shared MediaBrowser to AudioService. The bind itself is
+     * posted to the main looper by the framework, so it happens after this
+     * returns; {@code media_browser_connected} marks its completion.
+     */
+    private void connect(String reason) {
         if (mediaBrowser == null) {
             mediaBrowser = new MediaBrowserCompat(applicationContext,
                     new ComponentName(applicationContext, AudioService.class),
                     connectionCallback,
                     null);
+            log("media_browser_connect_requested", "generation=" + flutterEngineGeneration
+                    + " reason=" + reason
+                    + " browserHash=" + hashOf(mediaBrowser)
+                    + " messengerHash=" + hashOf(flutterPluginBinding != null ? flutterPluginBinding.getBinaryMessenger() : null)
+                    + " serviceGeneration=" + serviceGenerationOrNone());
             mediaBrowser.connect();
         }
     }
 
-    private void disconnect() {
+    /**
+     * Disconnects the shared MediaBrowser. Like the bind, the unbind is posted
+     * to the main looper, so it reaches the service after this returns.
+     */
+    private void disconnect(String reason) {
+        log("media_browser_disconnect_requested", "generation=" + flutterEngineGeneration
+                + " reason=" + reason
+                + " browserHash=" + hashOf(mediaBrowser)
+                + " browserConnected=" + (mediaBrowser != null && mediaBrowser.isConnected())
+                + " messengerHash=" + hashOf(flutterPluginBinding != null ? flutterPluginBinding.getBinaryMessenger() : null)
+                + " serviceGeneration=" + serviceGenerationOrNone());
         Activity activity = mainClientInterface != null ? mainClientInterface.activity : null;
         if (activity != null) {
             // Since the activity enters paused state, we set the intent with ACTION_MAIN.

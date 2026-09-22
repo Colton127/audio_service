@@ -14,6 +14,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
@@ -305,6 +306,11 @@ public class AudioService extends MediaBrowserServiceCompat {
         return playing;
     }
 
+    /** Diagnostic only: this instance's serviceGeneration. */
+    int getServiceGeneration() {
+        return serviceGeneration;
+    }
+
     public int getRepeatMode() {
         return repeatMode;
     }
@@ -375,6 +381,23 @@ public class AudioService extends MediaBrowserServiceCompat {
                 + " action=" + (intent != null ? intent.getAction() : "none"));
         MediaButtonReceiver.handleIntent(mediaSession, intent);
         return START_NOT_STICKY;
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        // The system calls onBind once per distinct intent, not per client:
+        // later clients with an equal intent reuse the binder without a call.
+        log("service_bind", "serviceGeneration=" + serviceGeneration
+                + " action=" + (intent != null ? intent.getAction() : "none"));
+        return super.onBind(intent);
+    }
+
+    @Override
+    public boolean onUnbind(Intent intent) {
+        // Called once all clients bound with this intent have unbound.
+        log("service_unbind", "serviceGeneration=" + serviceGeneration
+                + " action=" + (intent != null ? intent.getAction() : "none"));
+        return super.onUnbind(intent);
     }
 
     public void stop() {
@@ -910,6 +933,9 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     @Override
     public BrowserRoot onGetRoot(String clientPackageName, int clientUid, Bundle rootHints) {
+        // Unlike onBind, this runs for every MediaBrowser client and names it.
+        log("service_browser_client_connected", "serviceGeneration=" + serviceGeneration
+                + " clientPackage=" + clientPackageName + " clientUid=" + clientUid);
         Boolean isRecentRequest = rootHints == null ? null : (Boolean)rootHints.getBoolean(BrowserRoot.EXTRA_RECENT);
         if (isRecentRequest == null) isRecentRequest = false;
         Bundle extras = config.getBrowsableRootExtras();
