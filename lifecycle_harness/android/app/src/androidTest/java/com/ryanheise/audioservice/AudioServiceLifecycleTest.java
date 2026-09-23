@@ -8,10 +8,15 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import android.app.ActivityManager;
+import android.content.Context;
+import android.content.Intent;
 import android.os.Process;
 import android.os.SystemClock;
+import android.support.v4.media.session.MediaControllerCompat;
 
 import androidx.test.core.app.ActivityScenario;
+import androidx.test.core.app.ApplicationProvider;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.filters.LargeTest;
 import androidx.test.filters.MediumTest;
@@ -37,9 +42,10 @@ import java.util.concurrent.Callable;
  * Activity releases the plugin's final MediaBrowser client, which lets Android destroy the
  * unstarted, unbound AudioService without killing that process.</p>
  *
- * <p>Contract under test: after an AudioService instance is destroyed while not playing, the
- * shared FlutterEngine is kept for {@code AudioServicePlugin.ENGINE_DISPOSAL_DELAY_MS}. A client
- * that returns within that window reuses the engine; if none returns, the engine is disposed.</p>
+ * <p>Contract under test: after an AudioService instance is destroyed, whether or not its handler
+ * reports playing, the shared FlutterEngine is kept for
+ * {@code AudioServicePlugin.ENGINE_DISPOSAL_DELAY_MS}. A client that returns within that window
+ * reuses the engine; if none returns, the engine is disposed.</p>
  */
 @RunWith(AndroidJUnit4.class)
 public class AudioServiceLifecycleTest {
@@ -136,6 +142,83 @@ public class AudioServiceLifecycleTest {
         assertEquals("Application PID changed", initialPid, Process.myPid());
 
         closeActivityAndAwaitServiceDestruction(secondService);
+    }
+
+    /**
+     * The OS can stop AudioService while its handler still reports playing ("Stopping service due
+     * to app idle"). The engine must not be kept alive without a service: it is disposed after the
+     * same delay as when nothing was playing.
+     */
+    @Test
+    @MediumTest
+    public void flutterEngineIsDisposedWhenServiceIsDestroyedWhilePlaying() throws Exception {
+        final long disposalDelayMs = engineDisposalDelayMs();
+        final Context context = ApplicationProvider.getApplicationContext();
+
+        final AudioService service = launchAndAwaitNewService(null);
+        assertNotNull("Launching AudioServiceActivity must cache a FlutterEngine", cachedEngine());
+
+        final MediaControllerCompat[] controller = new MediaControllerCompat[1];
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    controller[0] = new MediaControllerCompat(context, service.getSessionToken());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        });
+        // The handler's media item reaches the session only once AudioService.init has
+        // registered the handler, so a play command sent after that is delivered to it.
+        waitUntil("The harness handler did not publish its media item",
+                new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() {
+                        return controller[0].getMetadata() != null;
+                    }
+                }, 60_000);
+        controller[0].getTransportControls().play();
+        waitUntil("AudioService did not enter its playing foreground state",
+                new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() {
+                        return service.isPlaying() && isAudioServiceStartedInForeground(context);
+                    }
+                });
+
+        // A started foreground service outlives its last binding, so closing the Activity leaves
+        // it running; it is then stopped from outside, as the OS does, while still playing.
+        openScenario.close();
+        openScenario = null;
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        assertSame("A playing AudioService must survive its Activity client closing",
+                service, AudioService.instance);
+        context.stopService(new Intent(context, AudioService.class));
+        waitUntil("AudioService was not destroyed after being stopped",
+                new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() {
+                        return AudioService.instance == null;
+                    }
+                });
+        final long destroyedAt = SystemClock.elapsedRealtime();
+        assertTrue("The handler must still report playing when its service is destroyed",
+                service.isPlaying());
+
+        waitUntil("FlutterEngine was kept alive after its service was destroyed while playing",
+                new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() {
+                        return cachedEngine() == null;
+                    }
+                }, disposalDelayMs + LIFECYCLE_TIMEOUT_MS);
+        final long disposedAfterMs = SystemClock.elapsedRealtime() - destroyedAt;
+        // Polling granularity makes the lower bound approximate; allow one poll interval.
+        assertTrue("FlutterEngine was disposed " + disposedAfterMs
+                        + " ms after service destruction, before the " + disposalDelayMs
+                        + " ms disposal delay",
+                disposedAfterMs + 100 >= disposalDelayMs);
     }
 
     private void exerciseServiceRecreations(int recreationCount) throws Exception {
@@ -235,6 +318,20 @@ public class AudioServiceLifecycleTest {
 
     private static Object cachedEngine() {
         return FlutterEngineCache.getInstance().get(AudioServicePlugin.getFlutterEngineId());
+    }
+
+    /** getRunningServices() is deprecated but still reports the caller's own services. */
+    @SuppressWarnings("deprecation")
+    private static boolean isAudioServiceStartedInForeground(Context context) {
+        final ActivityManager activityManager =
+                (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+        for (ActivityManager.RunningServiceInfo info
+                : activityManager.getRunningServices(Integer.MAX_VALUE)) {
+            if (AudioService.class.getName().equals(info.service.getClassName())) {
+                return info.started && info.foreground;
+            }
+        }
+        return false;
     }
 
     /**

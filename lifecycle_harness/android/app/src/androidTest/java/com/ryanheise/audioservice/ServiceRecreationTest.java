@@ -135,8 +135,8 @@ public class ServiceRecreationTest {
             before.disconnect();
 
             // Closing the activity unbinds the plugin's MediaBrowser; with no
-            // binding left the service is destroyed and, as nothing is
-            // playing, the engine's disposal is scheduled.
+            // binding left the service is destroyed and the engine's disposal
+            // is scheduled.
             scenario.close();
             await("service destroyed", () -> AudioService.instance == null, 10_000);
             assertNotNull("engine must survive service destruction", cachedEngine());
