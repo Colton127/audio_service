@@ -1,6 +1,7 @@
 package com.ryanheise.audioservice;
 
 import android.app.Activity;
+import android.app.Application;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -315,6 +316,8 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     private Context applicationContext;
     private FlutterPluginBinding flutterPluginBinding;
     private ActivityPluginBinding activityPluginBinding;
+    private Application.ActivityLifecycleCallbacks foregroundRetryCallbacks;
+    private Application foregroundRetryApplication;
     private NewIntentListener newIntentListener;
     private ClientInterface clientInterface;
     private final MediaBrowserCompat.ConnectionCallback connectionCallback = new MediaBrowserCompat.ConnectionCallback() {
@@ -420,6 +423,11 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 && audioHandlerInterface.messenger == flutterPluginBinding.getBinaryMessenger()) {
             audioHandlerInterface.destroy();
             audioHandlerInterface = null;
+            // A replacement engine must queue handler calls until its own
+            // Dart side configures, as the first engine of a process does:
+            // sent earlier, they reach a channel with no Dart handler, where
+            // Flutter buffers a single message and discards the rest.
+            flutterReady = false;
             // The handler interface is owned by the engine, not by an
             // AudioService instance, so it is unregistered from the service
             // here rather than in AudioService.onDestroy().
@@ -445,6 +453,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         clientInterface.setWrongEngineDetected(flutterPluginBinding.getBinaryMessenger() != sharedEngine.getDartExecutor());
         mainClientInterface = clientInterface;
         registerOnNewIntentListener();
+        registerForegroundRetry(binding.getActivity());
         if (mediaController != null) {
             MediaControllerCompat.setMediaController(mainClientInterface.activity, mediaController);
         }
@@ -466,6 +475,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 activityPluginBinding != null ? activityPluginBinding.getActivity() : null);
         activityPluginBinding.removeOnNewIntentListener(newIntentListener);
         activityPluginBinding = null;
+        unregisterForegroundRetry();
         clientInterface.setActivity(null);
         clientInterface.setContext(flutterPluginBinding.getApplicationContext());
     }
@@ -477,6 +487,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         clientInterface.setActivity(binding.getActivity());
         clientInterface.setContext(binding.getActivity());
         registerOnNewIntentListener();
+        registerForegroundRetry(binding.getActivity());
     }
 
     @Override
@@ -486,6 +497,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         activityPluginBinding.removeOnNewIntentListener(newIntentListener);
         activityPluginBinding = null;
         newIntentListener = null;
+        unregisterForegroundRetry();
         clientInterface.setActivity(null);
         clientInterface.setContext(flutterPluginBinding.getApplicationContext());
         if (clientInterfaces.size() == 1) {
@@ -496,6 +508,39 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         if (clientInterface == mainClientInterface) {
             mainClientInterface = null;
         }
+    }
+
+    /**
+     * While an Activity is resumed the app may start a foreground service, so
+     * a playing AudioService whose start from the background was refused
+     * gets it then (see AudioService.retryForegroundIfPlaying).
+     */
+    private void registerForegroundRetry(final Activity activity) {
+        unregisterForegroundRetry();
+        foregroundRetryCallbacks = new Application.ActivityLifecycleCallbacks() {
+            @Override
+            public void onActivityResumed(Activity resumed) {
+                if (resumed == activity && AudioService.instance != null) {
+                    AudioService.instance.retryForegroundIfPlaying("activity_resumed");
+                }
+            }
+
+            @Override public void onActivityCreated(Activity a, Bundle savedInstanceState) {}
+            @Override public void onActivityStarted(Activity a) {}
+            @Override public void onActivityPaused(Activity a) {}
+            @Override public void onActivityStopped(Activity a) {}
+            @Override public void onActivitySaveInstanceState(Activity a, Bundle outState) {}
+            @Override public void onActivityDestroyed(Activity a) {}
+        };
+        foregroundRetryApplication = activity.getApplication();
+        foregroundRetryApplication.registerActivityLifecycleCallbacks(foregroundRetryCallbacks);
+    }
+
+    private void unregisterForegroundRetry() {
+        if (foregroundRetryCallbacks == null) return;
+        foregroundRetryApplication.unregisterActivityLifecycleCallbacks(foregroundRetryCallbacks);
+        foregroundRetryCallbacks = null;
+        foregroundRetryApplication = null;
     }
 
     /** Generation of the live AudioService instance, or {@code none}. */
@@ -631,6 +676,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                     if (serviceConnectionFailed) {
                         throw new IllegalStateException("Unable to bind to AudioService. Please ensure you have declared a <service> element as described in the README.");
                     }
+                    log("flutter_configure", "generation=" + flutterEngineGeneration
+                            + " flutterReadyBefore=" + flutterReady
+                            + " activity=" + (activity != null)
+                            + " serviceGeneration=" + serviceGenerationOrNone());
                     flutterReady = true;
                     Map<?, ?> args = (Map<?, ?>)call.arguments;
                     Map<?, ?> configMap = (Map<?, ?>)args.get("config");
@@ -1273,16 +1322,53 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
         @UiThread
         public void invokeMethod(String method, Object arg, final Result result) {
+            log("handler_invoke", "generation=" + flutterEngineGeneration
+                    + " method=" + method + " flutterReady=" + flutterReady
+                    + " serviceGeneration=" + serviceGenerationOrNone());
+            final Result loggedResult = new LoggedResult(method, result);
             if (flutterReady) {
-                channel.invokeMethod(method, arg, result);
+                channel.invokeMethod(method, arg, loggedResult);
             } else {
-                methodInvocationQueue.add(new MethodInvocation(method, arg, result));
+                methodInvocationQueue.add(new MethodInvocation(method, arg, loggedResult));
             }
         }
 
         private void destroy() {
             if (silenceAudioTrack != null)
                 silenceAudioTrack.release();
+        }
+    }
+
+    /** Logs how Dart answered a handler invocation, then forwards the answer. */
+    private static class LoggedResult implements Result {
+        private final String method;
+        private final Result delegate;
+
+        LoggedResult(String method, Result delegate) {
+            this.method = method;
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void success(Object value) {
+            log("handler_result", "generation=" + flutterEngineGeneration
+                    + " method=" + method + " outcome=success");
+            if (delegate != null) delegate.success(value);
+        }
+
+        @Override
+        public void error(String errorCode, String errorMessage, Object errorDetails) {
+            log("handler_result", "generation=" + flutterEngineGeneration
+                    + " method=" + method + " outcome=error code=" + errorCode
+                    + " message=" + errorMessage);
+            if (delegate != null) delegate.error(errorCode, errorMessage, errorDetails);
+        }
+
+        @Override
+        public void notImplemented() {
+            log("handler_result", "generation=" + flutterEngineGeneration
+                    + " method=" + method + " outcome=not_implemented");
+            if (delegate != null) delegate.notImplemented();
         }
     }
 

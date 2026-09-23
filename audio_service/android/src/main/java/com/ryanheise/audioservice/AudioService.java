@@ -645,14 +645,14 @@ public class AudioService extends MediaBrowserServiceCompat {
         mediaSession.setCaptioningEnabled(captioningEnabled);
 
         if (replay) {
-            // Restoring, not transitioning. The session is activated so that
-            // a playing session is routed media buttons as before, but the
-            // foreground service, notification and wake lock are established
-            // by the next live update through enterPlayingState() (see
-            // playingStateEntered), and the idle/completed transitions are
-            // not re-run: the old instance already ran them.
+            // Restoring, not transitioning: the idle/completed transitions
+            // are not re-run, the old instance already ran them. A playing
+            // handler does get its foreground service, notification and wake
+            // lock back now, since a handler that keeps playing sends no
+            // further live update that would establish them.
             if (playing) {
                 activateMediaSession();
+                retryForegroundIfPlaying("state_replay");
             }
             return;
         }
@@ -814,9 +814,35 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
     }
 
+    /**
+     * Enters the playing state if the handler reports playing but this
+     * instance has not (yet) established it, e.g. after a refused
+     * foreground-service start or a state replay. A refusal is logged and
+     * left for a later attempt.
+     */
+    void retryForegroundIfPlaying(String reason) {
+        if (!playing || playingStateEntered) return;
+        log("foreground_retry", "serviceGeneration=" + serviceGeneration + " reason=" + reason);
+        try {
+            enterPlayingState();
+        } catch (IllegalStateException e) {
+            // Logged by enterPlayingState().
+        }
+    }
+
     private void enterPlayingState() {
         playingStateEntered = true;
-        ContextCompat.startForegroundService(this, new Intent(AudioService.this, AudioService.class));
+        try {
+            ContextCompat.startForegroundService(this, new Intent(AudioService.this, AudioService.class));
+        } catch (IllegalStateException e) {
+            // Android 12+ refuses the start from the background
+            // (ForegroundServiceStartNotAllowedException). Nothing was
+            // established, so a later live update or retry must try again.
+            playingStateEntered = false;
+            log("foreground_start_failed", "serviceGeneration=" + serviceGeneration
+                    + " error=" + e.getClass().getSimpleName());
+            throw e;
+        }
         if (!mediaSession.isActive())
             mediaSession.setActive(true);
 
