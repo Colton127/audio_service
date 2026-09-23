@@ -1037,23 +1037,22 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
 
         @Override
         public void onDestroy() {
-            // The OS may stop the service while audio is still playing, e.g.
-            // battery saver's App Standby restriction ("Stopping service due
-            // to app idle" after ~9 min without user interaction on some
-            // devices). The audio itself is rendered by plugins living in the
-            // Flutter engine, not by this service — destroying the engine here
-            // would needlessly kill the ongoing playback (and a later app
-            // launch cold-starts from the splash screen even though the
-            // process survived). Keep the engine alive in that case.
-            if (AudioService.instance != null && AudioService.instance.isPlaying()) {
-                log("flutter_engine_retained", "generation=" + flutterEngineGeneration
-                        + " reason=service_destroyed_while_playing");
-                return;
+            // The OS may stop the service while the handler still reports
+            // playing, e.g. "Stopping service due to app idle" once the
+            // service has lost its foreground state. The engine is disposed
+            // regardless: keeping it alive left audio playing in a process
+            // with no foreground service, media session or notification, where
+            // a media button could restart the service without it reaching
+            // startForeground(). Logged so these stops can be counted.
+            final AudioService service = AudioService.instance;
+            if (service != null && service.isPlaying()) {
+                log("service_destroyed_while_playing", "generation=" + flutterEngineGeneration
+                        + " serviceGeneration=" + service.getServiceGeneration()
+                        + " processingState=" + service.getProcessingState());
             }
-            // Otherwise the engine is disposed as before, but deferred rather
-            // than inline: a service instance that the system has already
-            // queued for creation must find the engine in the cache (see
-            // scheduleFlutterEngineDisposal).
+            // Deferred rather than inline: a service instance that the system
+            // has already queued for creation must find the engine in the
+            // cache (see scheduleFlutterEngineDisposal).
             scheduleFlutterEngineDisposal();
         }
 

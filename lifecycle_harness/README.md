@@ -3,21 +3,25 @@
 A standalone Flutter app, separate from `audio_service/example`, that runs Android
 instrumentation tests against the local `audio_service` checkout. It uses the plugin's own
 `AudioServiceActivity`, `AudioService`, and `MediaButtonReceiver` directly. `lib/main.dart` calls
-`AudioService.init` with a handler that never plays. The handler publishes one media item, with
+`AudioService.init` with a handler that renders no audio. The handler publishes one media item, with
 artwork from a local `file://` PNG so no network is needed, and a one-item queue, then shows a
-placeholder widget.
+placeholder widget. Its `play()` and `pause()` only publish a playing or paused state, which is
+enough to put `AudioService` in its playing foreground state.
 
 The tests live in the plugin's Java package so they can read package-private diagnostics such as
 `AudioService.instance` and `AudioServicePlugin.getFlutterEngineGeneration()`.
 
 ## Contract under test
 
-After an `AudioService` instance is destroyed while not playing, the shared FlutterEngine is kept
-for `AudioServicePlugin.ENGINE_DISPOSAL_DELAY_MS` (1000 ms):
+After an `AudioService` instance is destroyed, whether or not its handler reports playing, the
+shared FlutterEngine is kept for `AudioServicePlugin.ENGINE_DISPOSAL_DELAY_MS` (1000 ms):
 
 - A client that returns within that window reuses the engine, and the recreated service gets back
   the handler's state.
 - If no client returns, the engine is disposed.
+
+Earlier revisions kept the engine indefinitely when the service was destroyed while playing. A
+destroy while playing is now logged as `event=service_destroyed_while_playing`.
 
 ## Tests
 
@@ -32,6 +36,7 @@ waits for the service's `onDestroy` to complete, and relaunches. The process is 
 | `flutterEngineSurvivesServiceRecreationWithinDisposalDelay` | 3 recreations: same PID, a distinct `AudioService` each cycle, one engine generation |
 | `flutterEngineSurvivesOneHundredServiceRecreationsWithinDisposalDelay` | The same checks over 100 recreations |
 | `flutterEngineIsDisposedWhenNoClientReturnsWithinDisposalDelay` | With no client, the engine is disposed no earlier than the delay; the next launch creates exactly one new generation |
+| `flutterEngineIsDisposedWhenServiceIsDestroyedWhilePlaying` | The handler reports playing and the service is started in the foreground; after the Activity closes, `stopService` destroys it while still playing, as the OS does. The engine is disposed no earlier than the delay instead of being kept |
 
 The delay is read by reflection from `AudioServicePlugin.ENGINE_DISPOSAL_DELAY_MS`. On revisions
 without deferred disposal the field is absent, and the test treats the delay as 0, meaning inline
@@ -77,6 +82,11 @@ run `adb shell pm trim-caches 2G` or free space on the emulator.
 ## Results
 
 Device: `emulator-5554`, AVD `Phone_Screenshots`, Android 16 / API 36. Flutter 3.47.4.
+
+`flutterEngineIsDisposedWhenServiceIsDestroyedWhilePlaying` was added after these runs and has not
+been executed yet. On `minor` @ `d7cb502`, which still keeps the engine when the service is destroyed
+while playing, it is expected to fail with `FlutterEngine was kept alive after its service was
+destroyed while playing`.
 
 ### Fix: `claude/audio-service-ownership-reconnect-6x2z0s` passes
 
