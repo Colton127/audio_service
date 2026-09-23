@@ -56,14 +56,22 @@ This test was written on the fix branch and moved here from `audio_service/examp
 
 Checks that a playing handler ends up with a started, foreground `AudioService`, and that handler
 commands reach Dart. The instrumented process counts as foreground, so Android never refuses a
-foreground-service start here; refused starts are covered by ReliefMix's host runner
-(`system_test/android`, `service` category).
+foreground-service start here. The last four tests simulate refused and failed starts by replacing
+`AudioService.foregroundPromoter`, the seam around `startForegroundService()` and
+`startForeground()`; real refusals are covered by ReliefMix's host runner (`system_test/android`,
+`service` category). The harness handler counts errors that reach `AudioService.asyncError` in its
+media item's extras (`asyncErrorCount`, `lastAsyncError`), which the tests read through a
+`MediaController`.
 
 | Method | Checks |
 |---|---|
 | `commandsSentBeforeReplacementEngineConfiguresAreDelivered` | After the first engine is disposed, a replacement engine is created and two handler commands are sent in the same main-thread task, before its Dart side can configure. Both are delivered and the click starts playback |
 | `mediaButtonInsideDisposalWindowNeverLeavesForegroundStartPending` | The playing service is stopped from outside, then a play-pause `MEDIA_BUTTON` broadcast reaches the app's `MediaButtonReceiver` inside the disposal delay (as `MediaSessionService` sends it when no session is left; `cmd media_session dispatch` would target whichever app Android last recorded). No `AudioService` stays `fgRequired` (started with `startForegroundService()` but not yet foreground) for more than 5 s, and the press leaves a paused `AudioService` |
 | `serviceRecreatedWhilePlayingReturnsToForeground` | A playing service is stopped from outside and the Activity returns inside the disposal delay. The recreated service, which replays `playing`, is started in the foreground within 5 s |
+| `refusedForegroundStartLeavesNothingHalfEstablished` | API 31+. `startForeground()` throws `ForegroundServiceStartNotAllowedException` after `startForegroundService()` went through. The service is left not in the playing state, without its wake lock or a foreground service, with its media session still active; Dart gets one `FOREGROUND_START_REFUSED` error |
+| `liveUpdatesWhilePlayingDoNotRetryARefusedStart` | API 31+. After a refusal, 20 live updates (seeks, still playing) make no further attempt, and Dart is still told only once |
+| `activityResumeRetriesARefusedStartOnce` | API 31+. After a refusal, pausing and resuming the Activity makes exactly one more attempt, which puts the service in the foreground with its wake lock and reports nothing to Dart |
+| `foregroundStartFailureReachesDartAndIsNotRetried` | `startForeground()` throws a plain `IllegalStateException`, as for a missing or invalid foreground service type. Dart gets the error; neither 20 live updates nor an Activity resume retry it; a pause followed by a new play tries once more |
 
 ## Toolchain
 
@@ -111,6 +119,10 @@ tests failed:
 With the fixes, all 9 tests pass, also on a slow API 35 AVD (`Small_Phone_API_35`, 2 cores, 1 GB). `flutterReady` is reset when the handler's engine detaches. A
 replayed playing state re-enters the playing state (`foreground_retry reason=state_replay`). A refused
 foreground start clears `playingStateEntered`, and the next resume of the attached Activity retries it.
+
+The four refusal and failure tests were added afterwards, together with making the foreground start
+all-or-nothing, and have not been run yet. They need the `foregroundPromoter` seam, so they do not
+compile against earlier revisions.
 
 ### Earlier runs
 

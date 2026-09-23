@@ -1123,7 +1123,16 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                 case "setState": {
                     lastStateArgs = args;
                     applyState(args, false);
-                    result.success(null);
+                    if (AudioService.instance.consumeForegroundStartRefusal()) {
+                        // The state was applied; only the foreground service
+                        // is pending. Reported once per play, not per update.
+                        result.error("FOREGROUND_START_REFUSED",
+                                "Android refused to start AudioService in the foreground from the"
+                                        + " background; it is retried when the Activity next resumes",
+                                null);
+                    } else {
+                        result.success(null);
+                    }
                     break;
                 }
                 case "setAndroidPlaybackInfo": {

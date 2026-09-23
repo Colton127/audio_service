@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 /// Minimal app for the AudioService lifecycle instrumentation tests.
@@ -13,10 +14,13 @@ import 'package:flutter/widgets.dart';
 /// artwork) and a queue so that ServiceRecreationTest can check that state is
 /// replayed into a recreated AudioService. Its play() and pause() only publish
 /// a playing or paused state, which puts AudioService in (or takes it out of)
-/// its playing foreground state as real playback would.
+/// its playing foreground state as real playback would, and seek() publishes
+/// a new position without leaving that state. Errors reaching
+/// AudioService.asyncError are counted in the media item's extras, where the
+/// instrumentation tests read them through a MediaController.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await AudioService.init(
+  final handler = await AudioService.init(
     builder: () => _HarnessAudioHandler(),
     config: const AudioServiceConfig(
       androidNotificationChannelId:
@@ -24,6 +28,7 @@ Future<void> main() async {
       androidNotificationChannelName: 'Audio playback',
     ),
   );
+  AudioService.asyncError.listen(handler.reportAsyncError);
   runApp(const Directionality(
     textDirection: TextDirection.ltr,
     child: Center(child: Text('AudioService lifecycle harness')),
@@ -51,6 +56,27 @@ class _HarnessAudioHandler extends BaseAudioHandler {
   @override
   Future<void> pause() async {
     playbackState.add(playbackState.value.copyWith(playing: false));
+  }
+
+  @override
+  Future<void> seek(Duration position) async {
+    playbackState.add(playbackState.value.copyWith(updatePosition: position));
+  }
+
+  var _asyncErrorCount = 0;
+
+  void reportAsyncError(Object error) {
+    // A failed media item update is reported with this code; counting it
+    // would send another media item update, which could fail the same way.
+    if (error is PlatformException && error.code == 'UNEXPECTED_ERROR') return;
+    final item = mediaItem.value;
+    if (item == null) return;
+    _asyncErrorCount++;
+    mediaItem.add(item.copyWith(extras: {
+      ...?item.extras,
+      'asyncErrorCount': _asyncErrorCount,
+      'lastAsyncError': error is PlatformException ? error.code : '$error',
+    }));
   }
 
   Future<void> _publish() async {
