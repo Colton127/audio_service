@@ -56,7 +56,7 @@ This test was written on the fix branch and moved here from `audio_service/examp
 
 Checks that a playing handler ends up with a started, foreground `AudioService`, and that handler
 commands reach Dart. The instrumented process counts as foreground, so Android never refuses a
-foreground-service start here. The last four tests simulate refused and failed starts by replacing
+foreground-service start here. The last five tests simulate refused and failed starts by replacing
 `AudioService.foregroundPromoter`, the seam around `startForegroundService()` and
 `startForeground()`; real refusals are covered by ReliefMix's host runner (`system_test/android`,
 `service` category). The harness handler counts errors that reach `AudioService.asyncError` in its
@@ -72,6 +72,7 @@ media item's extras (`asyncErrorCount`, `lastAsyncError`), which the tests read 
 | `liveUpdatesWhilePlayingDoNotRetryARefusedStart` | API 31+. After a refusal, 20 live updates (seeks, still playing) make no further attempt, and Dart is still told only once |
 | `activityResumeRetriesARefusedStartOnce` | API 31+. After a refusal, pausing and resuming the Activity makes exactly one more attempt, which puts the service in the foreground with its wake lock and reports nothing to Dart |
 | `foregroundStartFailureReachesDartAndIsNotRetried` | `startForeground()` throws a plain `IllegalStateException`, as for a missing or invalid foreground service type. Dart gets the error; neither 20 live updates nor an Activity resume retry it; a pause followed by a new play tries once more |
+| `failedRetryOnActivityResumeIsLoggedNotThrown` | API 31+. After a refusal, the retry from the Activity's resume fails with a plain `IllegalStateException`. It is logged, not thrown into the lifecycle callback: the process survives, the service keeps playing without the playing state, Dart is not told, and the next resume does not retry. A pause followed by a new play tries once more and reports the failure to Dart |
 
 ## Toolchain
 
@@ -120,7 +121,7 @@ With the fixes, all 9 tests pass, also on a slow API 35 AVD (`Small_Phone_API_35
 replayed playing state re-enters the playing state (`foreground_retry reason=state_replay`). A refused
 foreground start clears `playingStateEntered`, and the next resume of the attached Activity retries it.
 
-The four refusal and failure tests were added afterwards, together with making the foreground start
+The five refusal and failure tests were added afterwards, together with making the foreground start
 all-or-nothing, and have not been run yet. They need the `foregroundPromoter` seam, so they do not
 compile against earlier revisions.
 

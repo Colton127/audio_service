@@ -26,6 +26,7 @@ import android.support.v4.media.RatingCompat;
 import android.support.v4.media.session.MediaControllerCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
+import android.util.Log;
 import android.util.LruCache;
 import android.util.Size;
 import android.view.KeyEvent;
@@ -867,13 +868,22 @@ public class AudioService extends MediaBrowserServiceCompat {
      * Enters the playing state if the handler reports playing but this
      * instance has not established it, at a point where Android is likely to
      * allow the foreground-service start (an Activity resumed, a state
-     * replay). A refusal is logged and left for the next such point; any other
-     * failure propagates and is not retried here until playback restarts.
+     * replay). A refusal is logged and left for the next such point. Any other
+     * failure is logged with its stack trace and not retried here until
+     * playback restarts. Never throws: it runs from lifecycle callbacks, where
+     * an exception would crash the app.
      */
     void retryForegroundIfPlaying(String reason) {
         if (!playing || playingStateEntered || foregroundFailure == ForegroundFailure.FAILED) return;
         log("foreground_retry", "serviceGeneration=" + serviceGeneration + " reason=" + reason);
-        enterPlayingState();
+        try {
+            enterPlayingState();
+        } catch (RuntimeException e) {
+            // enterPlayingState() recorded it as FAILED, so it is not retried
+            // here again; a live update from a new play still reports it to Dart.
+            Log.e(AudioServiceLifecycleLog.TAG, "foreground retry failed: reason=" + reason
+                    + " serviceGeneration=" + serviceGeneration, e);
+        }
     }
 
     /**

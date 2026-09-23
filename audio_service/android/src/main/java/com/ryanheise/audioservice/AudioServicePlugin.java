@@ -513,7 +513,8 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     /**
      * While an Activity is resumed the app may start a foreground service, so
      * a playing AudioService whose start from the background was refused
-     * gets it then (see AudioService.retryForegroundIfPlaying).
+     * gets it then (see AudioService.retryForegroundIfPlaying, which logs a
+     * failure rather than throwing it into this lifecycle callback).
      */
     private void registerForegroundRetry(final Activity activity) {
         unregisterForegroundRetry();

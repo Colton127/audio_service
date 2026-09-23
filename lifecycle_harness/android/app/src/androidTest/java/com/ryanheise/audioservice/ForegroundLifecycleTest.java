@@ -269,8 +269,7 @@ public class ForegroundLifecycleTest {
         assertEquals(1, promoter.attempts.get());
 
         promoter.mode = ScriptedPromoter.Mode.ALLOW;
-        scenario.moveToState(Lifecycle.State.STARTED);
-        scenario.moveToState(Lifecycle.State.RESUMED);
+        pauseAndResumeActivity();
 
         await("The resumed Activity did not bring the playing AudioService into the foreground",
                 () -> AudioService.instance.isPlayingStateEntered() && isAudioServiceStartedInForeground(),
@@ -278,6 +277,42 @@ public class ForegroundLifecycleTest {
         assertEquals("One resume must make exactly one attempt", 2, promoter.attempts.get());
         assertTrue("The playing state must hold the wake lock", AudioService.instance.isWakeLockHeld());
         assertEquals("A retry must not report to Dart", 1, asyncErrorCount(controller));
+    }
+
+    /**
+     * A retry runs from the Activity's lifecycle callback, where a thrown exception would crash the
+     * app. A failure other than a refusal must be logged there instead, recorded so that later
+     * resumes do not retry it, and still reach Dart when a new play tries again.
+     */
+    @Test
+    public void failedRetryOnActivityResumeIsLoggedNotThrown() throws Exception {
+        assumeTrue("ForegroundServiceStartNotAllowedException needs API 31", Build.VERSION.SDK_INT >= 31);
+        final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.REFUSE);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        final int pid = Process.myPid();
+        play(controller);
+        await("The refusal was not reported to Dart", () -> asyncErrorCount(controller) == 1, TIMEOUT_MS);
+
+        // Thrown out of onActivityResumed(), this would kill the process running this test.
+        promoter.mode = ScriptedPromoter.Mode.FAIL;
+        pauseAndResumeActivity();
+        assertEquals("The resume must retry the refused start once", 2, promoter.attempts.get());
+        assertEquals("Application PID changed", pid, Process.myPid());
+        final AudioService service = AudioService.instance;
+        assertNotNull("AudioService must survive a failed retry", service);
+        assertTrue("The handler must still report playing", service.isPlaying());
+        assertFalse(service.isPlayingStateEntered());
+        assertFalse(service.isWakeLockHeld());
+        assertEquals("A retry must not report to Dart", 1, asyncErrorCount(controller));
+
+        pauseAndResumeActivity();
+        assertEquals("A failed retry must not be retried by the next resume", 2, promoter.attempts.get());
+
+        pause(controller);
+        play(controller);
+        await("The failure of the new play did not reach Dart", () -> asyncErrorCount(controller) == 2, TIMEOUT_MS);
+        assertEquals(SIMULATED_FAILURE, lastAsyncError(controller));
+        assertEquals("A new play must try again, once", 3, promoter.attempts.get());
     }
 
     /**
@@ -297,17 +332,11 @@ public class ForegroundLifecycleTest {
         assertFalse(AudioService.instance.isWakeLockHeld());
 
         sendLiveUpdates(controller);
-        scenario.moveToState(Lifecycle.State.STARTED);
-        scenario.moveToState(Lifecycle.State.RESUMED);
-        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+        pauseAndResumeActivity();
         assertEquals("A failed start must not be retried by live updates or a resume",
                 1, promoter.attempts.get());
 
-        runOnMain(() -> {
-            controller.getTransportControls().pause();
-            return null;
-        });
-        await("The handler did not pause", () -> !AudioService.instance.isPlaying(), TIMEOUT_MS);
+        pause(controller);
         play(controller);
         await("The failure of the new play did not reach Dart", () -> asyncErrorCount(controller) == 2, TIMEOUT_MS);
         assertEquals("A new play must try again, once", 2, promoter.attempts.get());
@@ -326,6 +355,22 @@ public class ForegroundLifecycleTest {
         });
         await("The handler did not start playing",
                 () -> AudioService.instance != null && AudioService.instance.isPlaying(), TIMEOUT_MS);
+    }
+
+    private void pause(MediaControllerCompat controller) throws Exception {
+        runOnMain(() -> {
+            controller.getTransportControls().pause();
+            return null;
+        });
+        await("The handler did not pause",
+                () -> AudioService.instance != null && !AudioService.instance.isPlaying(), TIMEOUT_MS);
+    }
+
+    /** Pauses and resumes the Activity, which runs the plugin's resume retry once. */
+    private void pauseAndResumeActivity() {
+        scenario.moveToState(Lifecycle.State.STARTED);
+        scenario.moveToState(Lifecycle.State.RESUMED);
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync();
     }
 
     /** Seeks {@link #LIVE_UPDATES} times; each seek is a live state update that keeps playing. */
