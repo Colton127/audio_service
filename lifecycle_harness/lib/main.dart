@@ -63,6 +63,27 @@ class _HarnessAudioHandler extends BaseAudioHandler {
     playbackState.add(playbackState.value.copyWith(updatePosition: position));
   }
 
+  /// The children of [slowParentMediaId] are answered after five seconds, so
+  /// that a test can destroy AudioService while the request is pending.
+  static const slowParentMediaId = 'slow';
+
+  /// Asking for the children of [failingParentMediaId] throws.
+  static const failingParentMediaId = 'failing';
+
+  @override
+  Future<List<MediaItem>> getChildren(String parentMediaId,
+      [Map<String, dynamic>? options]) async {
+    switch (parentMediaId) {
+      case slowParentMediaId:
+        await Future<void>.delayed(const Duration(seconds: 5));
+        return queue.value;
+      case failingParentMediaId:
+        throw StateError('simulated getChildren failure');
+      default:
+        return [];
+    }
+  }
+
   var _asyncErrorCount = 0;
 
   void reportAsyncError(Object error) {

@@ -281,11 +281,12 @@ public class ForegroundLifecycleTest {
 
     /**
      * A retry runs from the Activity's lifecycle callback, where a thrown exception would crash the
-     * app. A failure other than a refusal must be logged there instead, recorded so that later
-     * resumes do not retry it, and still reach Dart when a new play tries again.
+     * app. A failure other than a refusal must be reported instead (logged and delivered to
+     * AudioService.asyncError), recorded so that later resumes do not retry it, and tried again by
+     * a new play.
      */
     @Test
-    public void failedRetryOnActivityResumeIsLoggedNotThrown() throws Exception {
+    public void failedRetryOnActivityResumeIsReportedNotThrown() throws Exception {
         assumeTrue("ForegroundServiceStartNotAllowedException needs API 31", Build.VERSION.SDK_INT >= 31);
         final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.REFUSE);
         final MediaControllerCompat controller = launchAndAwaitHandler();
@@ -303,14 +304,16 @@ public class ForegroundLifecycleTest {
         assertTrue("The handler must still report playing", service.isPlaying());
         assertFalse(service.isPlayingStateEntered());
         assertFalse(service.isWakeLockHeld());
-        assertEquals("A retry must not report to Dart", 1, asyncErrorCount(controller));
+        await("The failed retry did not reach AudioService.asyncError",
+                () -> asyncErrorCount(controller) == 2, TIMEOUT_MS);
+        assertEquals("AudioService.retryForegroundIfPlaying", lastAsyncError(controller));
 
         pauseAndResumeActivity();
         assertEquals("A failed retry must not be retried by the next resume", 2, promoter.attempts.get());
 
         pause(controller);
         play(controller);
-        await("The failure of the new play did not reach Dart", () -> asyncErrorCount(controller) == 2, TIMEOUT_MS);
+        await("The failure of the new play did not reach Dart", () -> asyncErrorCount(controller) == 3, TIMEOUT_MS);
         assertEquals(SIMULATED_FAILURE, lastAsyncError(controller));
         assertEquals("A new play must try again, once", 3, promoter.attempts.get());
     }

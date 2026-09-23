@@ -585,6 +585,29 @@ void main() {
       );
     });
 
+    test('onPlatformError', () async {
+      final recorder = _PlatformErrorRecorder();
+      platform.setHandlerCallbacks(recorder);
+      for (final request in const [
+        OnPlatformErrorRequest(
+          where: 'AudioService.onStartCommand',
+          type: 'java.lang.IllegalStateException',
+          message: 'simulated',
+          stackTrace: 'java.lang.IllegalStateException: simulated',
+        ),
+        OnPlatformErrorRequest(
+          where: 'MediaButtonReceiver.onReceive',
+          type: 'java.lang.NullPointerException',
+          stackTrace: 'java.lang.NullPointerException',
+        ),
+      ]) {
+        await handlerChannel.invokeMethod<void>(
+            'onPlatformError', request.toMap());
+        expect(recorder.requests.last.toMap(), equals(request.toMap()));
+      }
+      expect(recorder.requests, hasLength(2));
+    });
+
     test('onNotificationDeleted', () async {
       const request = OnNotificationDeletedRequest();
       await handlerChannel.invokeMethod<void>(
@@ -708,3 +731,17 @@ void main() {
 }
 
 T? _ambiguate<T>(T? value) => value;
+
+/// Records onPlatformError requests. The generated mock predates that
+/// callback; every other callback is left to noSuchMethod.
+class _PlatformErrorRecorder extends AudioHandlerCallbacks {
+  final requests = <OnPlatformErrorRequest>[];
+
+  @override
+  Future<void> onPlatformError(OnPlatformErrorRequest request) async {
+    requests.add(request);
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}

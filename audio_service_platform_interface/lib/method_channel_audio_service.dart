@@ -216,6 +216,14 @@ class MethodChannelAudioService extends AudioServicePlatform {
         await callbacks.onNotificationClicked(OnNotificationClickedRequest(
             clicked: call.arguments['clicked'] as bool));
         return null;
+      case 'onPlatformError':
+        await callbacks.onPlatformError(OnPlatformErrorRequest(
+          where: call.arguments['where'] as String,
+          type: call.arguments['type'] as String,
+          message: call.arguments['message'] as String?,
+          stackTrace: call.arguments['stackTrace'] as String,
+        ));
+        return null;
       case 'getChildren':
         return (await callbacks.getChildren(GetChildrenRequest(
                 parentMediaId: call.arguments['parentMediaId'] as String,

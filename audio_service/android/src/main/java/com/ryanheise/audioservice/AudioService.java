@@ -26,7 +26,6 @@ import android.support.v4.media.RatingCompat;
 import android.support.v4.media.session.MediaControllerCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
-import android.util.Log;
 import android.util.LruCache;
 import android.util.Size;
 import android.view.KeyEvent;
@@ -113,6 +112,40 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     public static void init(ServiceListener listener) {
         AudioService.listener = listener;
+    }
+
+    private interface ListenerCall {
+        void call(ServiceListener listener);
+    }
+
+    /**
+     * Calls into the plugin's listener, if one is registered. These calls run
+     * from framework callbacks (media session commands, service lifecycle),
+     * where an exception would crash the app, so it is reported instead.
+     */
+    private static void callListener(String where, ListenerCall call) {
+        final ServiceListener listener = AudioService.listener;
+        if (listener == null) return;
+        try {
+            call.call(listener);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report(where, e);
+        }
+    }
+
+    /**
+     * Answers a browse request (children, item or search) whose handling
+     * failed, unless it was already answered. It is answered with null, which
+     * MediaBrowser clients receive as an error: Result.sendError() throws
+     * UnsupportedOperationException for these requests, it is only supported
+     * for custom actions.
+     */
+    static void failIfUnanswered(Result<?> result) {
+        try {
+            result.sendResult(null);
+        } catch (IllegalStateException alreadyAnswered) {
+            // Nothing left to answer.
+        }
     }
 
     public static int toKeyCode(long action) {
@@ -391,12 +424,10 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         log("service_engine_request", "serviceGeneration=" + serviceGeneration);
         flutterEngine = AudioServicePlugin.getFlutterEngine(this);
-        if (listener != null) {
-            // If this instance replaces a destroyed one while the engine (and
-            // the Dart AudioHandler) survived, the listener projects the
-            // current state into this fresh MediaSession.
-            listener.onCreate();
-        }
+        // If this instance replaces a destroyed one while the engine (and the
+        // Dart AudioHandler) survived, the listener projects the current state
+        // into this fresh MediaSession.
+        callListener("AudioService.onCreate", ServiceListener::onCreate);
         log("service_create_end", "serviceGeneration=" + serviceGeneration
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
                 + " engineHash=" + hashOf(flutterEngine));
@@ -407,7 +438,11 @@ public class AudioService extends MediaBrowserServiceCompat {
         log("service_start_command", "serviceGeneration=" + serviceGeneration
                 + " startId=" + startId + " flags=" + flags
                 + " action=" + (intent != null ? intent.getAction() : "none"));
-        MediaButtonReceiver.handleIntent(mediaSession, intent);
+        try {
+            MediaButtonReceiver.handleIntent(mediaSession, intent);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onStartCommand", e);
+        }
         return START_NOT_STICKY;
     }
 
@@ -440,14 +475,12 @@ public class AudioService extends MediaBrowserServiceCompat {
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
                 + " engineHash=" + hashOf(flutterEngine));
         super.onDestroy();
-        if (listener != null) {
-            // The listener (the plugin's AudioHandlerInterface) belongs to the
-            // shared FlutterEngine, which outlives this service instance. It
-            // stays registered so that a recreated service keeps dispatching to
-            // the same AudioHandler; the plugin clears it when the engine that
-            // hosts it is detached.
-            listener.onDestroy();
-        }
+        // The listener (the plugin's AudioHandlerInterface) belongs to the
+        // shared FlutterEngine, which outlives this service instance. It stays
+        // registered so that a recreated service keeps dispatching to the same
+        // AudioHandler; the plugin clears it when the engine that hosts it is
+        // detached. A failure there must not skip the cleanup below.
+        callListener("AudioService.onDestroy", ServiceListener::onDestroy);
         mediaMetadata = null;
         artBitmap = null;
         queue.clear();
@@ -731,13 +764,11 @@ public class AudioService extends MediaBrowserServiceCompat {
                 volumeProvider = new VolumeProviderCompat(volumeControlType, maxVolume, volume) {
                     @Override
                     public void onSetVolumeTo(int volumeIndex) {
-                        if (listener == null) return;
-                        listener.onSetVolumeTo(volumeIndex);
+                        callListener("VolumeProvider.onSetVolumeTo", l -> l.onSetVolumeTo(volumeIndex));
                     }
                     @Override
                     public void onAdjustVolume(int direction) {
-                        if (listener == null) return;
-                        listener.onAdjustVolume(direction);
+                        callListener("VolumeProvider.onAdjustVolume", l -> l.onAdjustVolume(direction));
                     }
                 };
             } else {
@@ -829,8 +860,7 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     public void handleDeleteNotification() {
-        if (listener == null) return;
-        listener.onClose();
+        callListener("AudioService.handleDeleteNotification", ServiceListener::onClose);
     }
 
 
@@ -869,7 +899,7 @@ public class AudioService extends MediaBrowserServiceCompat {
      * instance has not established it, at a point where Android is likely to
      * allow the foreground-service start (an Activity resumed, a state
      * replay). A refusal is logged and left for the next such point. Any other
-     * failure is logged with its stack trace and not retried here until
+     * failure is reported (see AudioServiceErrors) and not retried here until
      * playback restarts. Never throws: it runs from lifecycle callbacks, where
      * an exception would crash the app.
      */
@@ -880,9 +910,8 @@ public class AudioService extends MediaBrowserServiceCompat {
             enterPlayingState();
         } catch (RuntimeException e) {
             // enterPlayingState() recorded it as FAILED, so it is not retried
-            // here again; a live update from a new play still reports it to Dart.
-            Log.e(AudioServiceLifecycleLog.TAG, "foreground retry failed: reason=" + reason
-                    + " serviceGeneration=" + serviceGeneration, e);
+            // here again; a new play attempts it again from a live update.
+            AudioServiceErrors.report("AudioService.retryForegroundIfPlaying", e);
         }
     }
 
@@ -1059,7 +1088,14 @@ public class AudioService extends MediaBrowserServiceCompat {
         this.mediaMetadata = mediaMetadata;
         mediaSession.setMetadata(mediaMetadata);
         handler.removeCallbacksAndMessages(null);
-        handler.post(this::updateNotification);
+        handler.post(() -> {
+            // Posted, so nothing up the stack would catch a failure.
+            try {
+                updateNotification();
+            } catch (RuntimeException e) {
+                AudioServiceErrors.report("AudioService.updateNotification", e);
+            }
+        });
     }
 
     private MediaMetadataCompat putArtToMetadata(MediaMetadataCompat mediaMetadata) {
@@ -1091,121 +1127,148 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     @Override
     public void onLoadChildren(final String parentMediaId, final Result<List<MediaBrowserCompat.MediaItem>> result, Bundle options) {
+        final ServiceListener listener = AudioService.listener;
         if (listener == null) {
             result.sendResult(new ArrayList<>());
             return;
         }
-        listener.onLoadChildren(parentMediaId, result, options);
+        try {
+            listener.onLoadChildren(parentMediaId, result, options);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onLoadChildren", e);
+            failIfUnanswered(result);
+        }
     }
 
     @Override
     public void onLoadItem(String itemId, Result<MediaBrowserCompat.MediaItem> result) {
+        final ServiceListener listener = AudioService.listener;
         if (listener == null) {
             result.sendResult(null);
             return;
         }
-        listener.onLoadItem(itemId, result);
+        try {
+            listener.onLoadItem(itemId, result);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onLoadItem", e);
+            failIfUnanswered(result);
+        }
     }
 
     @Override
     public void onSearch(String query, Bundle extras, Result<List<MediaBrowserCompat.MediaItem>> result) {
+        final ServiceListener listener = AudioService.listener;
         if (listener == null) {
             result.sendResult(new ArrayList<>());
             return;
         }
-        listener.onSearch(query, extras, result);
+        try {
+            listener.onSearch(query, extras, result);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onSearch", e);
+            failIfUnanswered(result);
+        }
     }
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         log("service_task_removed", "serviceGeneration=" + serviceGeneration);
-        if (listener != null) {
-            listener.onTaskRemoved();
-        }
+        callListener("AudioService.onTaskRemoved", ServiceListener::onTaskRemoved);
         super.onTaskRemoved(rootIntent);
     }
 
+    /**
+     * Called by the framework for commands from any media controller
+     * (notification, lock screen, Bluetooth, Android Auto, other apps), so every
+     * call into the listener goes through callListener().
+     */
     public class MediaSessionCallback extends MediaSessionCompat.Callback {
         @Override
         public void onAddQueueItem(MediaDescriptionCompat description) {
-            if (listener == null) return;
-            listener.onAddQueueItem(getMediaMetadata(description.getMediaId()));
+            callListener("MediaSessionCallback.onAddQueueItem",
+                    l -> l.onAddQueueItem(getMediaMetadata(description.getMediaId())));
         }
 
         @Override
         public void onAddQueueItem(MediaDescriptionCompat description, int index) {
-            if (listener == null) return;
-            listener.onAddQueueItemAt(getMediaMetadata(description.getMediaId()), index);
+            callListener("MediaSessionCallback.onAddQueueItem",
+                    l -> l.onAddQueueItemAt(getMediaMetadata(description.getMediaId()), index));
         }
 
         @Override
         public void onRemoveQueueItem(MediaDescriptionCompat description) {
-            if (listener == null) return;
-            listener.onRemoveQueueItem(getMediaMetadata(description.getMediaId()));
+            callListener("MediaSessionCallback.onRemoveQueueItem",
+                    l -> l.onRemoveQueueItem(getMediaMetadata(description.getMediaId())));
         }
 
         @Override
         public void onPrepare() {
-            if (listener == null) return;
-            if (!mediaSession.isActive())
-                mediaSession.setActive(true);
-            listener.onPrepare();
+            callListener("MediaSessionCallback.onPrepare", l -> {
+                activateMediaSession();
+                l.onPrepare();
+            });
         }
 
         @Override
         public void onPrepareFromMediaId(String mediaId, Bundle extras) {
-            if (listener == null) return;
-            if (!mediaSession.isActive())
-                mediaSession.setActive(true);
-            listener.onPrepareFromMediaId(mediaId, extras);
+            callListener("MediaSessionCallback.onPrepareFromMediaId", l -> {
+                activateMediaSession();
+                l.onPrepareFromMediaId(mediaId, extras);
+            });
         }
 
         @Override
         public void onPrepareFromSearch(String query, Bundle extras) {
-            if (listener == null) return;
-            if (!mediaSession.isActive())
-                mediaSession.setActive(true);
-            listener.onPrepareFromSearch(query, extras);
+            callListener("MediaSessionCallback.onPrepareFromSearch", l -> {
+                activateMediaSession();
+                l.onPrepareFromSearch(query, extras);
+            });
         }
 
         @Override
         public void onPrepareFromUri(Uri uri, Bundle extras) {
-            if (listener == null) return;
-            if (!mediaSession.isActive())
-                mediaSession.setActive(true);
-            listener.onPrepareFromUri(uri, extras);
+            callListener("MediaSessionCallback.onPrepareFromUri", l -> {
+                activateMediaSession();
+                l.onPrepareFromUri(uri, extras);
+            });
         }
 
         @Override
         public void onPlay() {
-            if (listener == null) return;
-            listener.onPlay();
+            callListener("MediaSessionCallback.onPlay", ServiceListener::onPlay);
         }
 
         @Override
         public void onPlayFromMediaId(final String mediaId, final Bundle extras) {
-            if (listener == null) return;
-            listener.onPlayFromMediaId(mediaId, extras);
+            callListener("MediaSessionCallback.onPlayFromMediaId", l -> l.onPlayFromMediaId(mediaId, extras));
         }
 
         @Override
         public void onPlayFromSearch(final String query, final Bundle extras) {
-            if (listener == null) return;
-            listener.onPlayFromSearch(query, extras);
+            callListener("MediaSessionCallback.onPlayFromSearch", l -> l.onPlayFromSearch(query, extras));
         }
 
         @Override
         public void onPlayFromUri(final Uri uri, final Bundle extras) {
-            if (listener == null) return;
-            listener.onPlayFromUri(uri, extras);
+            callListener("MediaSessionCallback.onPlayFromUri", l -> l.onPlayFromUri(uri, extras));
         }
 
         @Override
         public boolean onMediaButtonEvent(Intent mediaButtonEvent) {
             if (listener == null) return false;
-            // TODO: use typesafe version once SDK 33 is released.
-            @SuppressWarnings("deprecation")
-            final KeyEvent event = (KeyEvent)mediaButtonEvent.getExtras().getParcelable(Intent.EXTRA_KEY_EVENT);
+            final KeyEvent event;
+            try {
+                final Bundle extras = mediaButtonEvent != null ? mediaButtonEvent.getExtras() : null;
+                // TODO: use typesafe version once SDK 33 is released.
+                @SuppressWarnings("deprecation")
+                final KeyEvent extra = extras != null ? (KeyEvent)extras.getParcelable(Intent.EXTRA_KEY_EVENT) : null;
+                event = extra;
+            } catch (RuntimeException e) {
+                // The intent can come from any app; its extras may not unparcel.
+                AudioServiceErrors.report("MediaSessionCallback.onMediaButtonEvent", e);
+                return true;
+            }
+            if (event == null) return false;
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                 switch (event.getKeyCode()) {
                 case KEYCODE_BYPASS_PLAY:
@@ -1238,7 +1301,7 @@ public class AudioService extends MediaBrowserServiceCompat {
                     // These are the "genuine" media button click events
                 case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
                 case KeyEvent.KEYCODE_HEADSETHOOK:
-                    listener.onClick(eventToButton(event));
+                    callListener("MediaSessionCallback.onMediaButtonEvent", l -> l.onClick(eventToButton(event)));
                     break;
                 }
             }
@@ -1261,100 +1324,87 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         @Override
         public void onPause() {
-            if (listener == null) return;
-            listener.onPause();
+            callListener("MediaSessionCallback.onPause", ServiceListener::onPause);
         }
 
         @Override
         public void onStop() {
-            if (listener == null) return;
-            listener.onStop();
+            callListener("MediaSessionCallback.onStop", ServiceListener::onStop);
         }
 
         @Override
         public void onSkipToNext() {
-            if (listener == null) return;
-            listener.onSkipToNext();
+            callListener("MediaSessionCallback.onSkipToNext", ServiceListener::onSkipToNext);
         }
 
         @Override
         public void onSkipToPrevious() {
-            if (listener == null) return;
-            listener.onSkipToPrevious();
+            callListener("MediaSessionCallback.onSkipToPrevious", ServiceListener::onSkipToPrevious);
         }
 
         @Override
         public void onFastForward() {
-            if (listener == null) return;
-            listener.onFastForward();
+            callListener("MediaSessionCallback.onFastForward", ServiceListener::onFastForward);
         }
 
         @Override
         public void onRewind() {
-            if (listener == null) return;
-            listener.onRewind();
+            callListener("MediaSessionCallback.onRewind", ServiceListener::onRewind);
         }
 
         @Override
         public void onSkipToQueueItem(long id) {
-            if (listener == null) return;
-            listener.onSkipToQueueItem(id);
+            callListener("MediaSessionCallback.onSkipToQueueItem", l -> l.onSkipToQueueItem(id));
         }
 
         @Override
         public void onSeekTo(long pos) {
-            if (listener == null) return;
-            listener.onSeekTo(pos);
+            callListener("MediaSessionCallback.onSeekTo", l -> l.onSeekTo(pos));
         }
 
         @Override
         public void onSetRating(RatingCompat rating) {
-            if (listener == null) return;
-            listener.onSetRating(rating);
+            callListener("MediaSessionCallback.onSetRating", l -> l.onSetRating(rating));
         }
 
         @Override
         public void onSetPlaybackSpeed(float speed) {
-            if (listener == null) return;
-            listener.onSetPlaybackSpeed(speed);
+            callListener("MediaSessionCallback.onSetPlaybackSpeed", l -> l.onSetPlaybackSpeed(speed));
         }
 
         @Override
         public void onSetCaptioningEnabled(boolean enabled) {
-            if (listener == null) return;
-            listener.onSetCaptioningEnabled(enabled);
+            callListener("MediaSessionCallback.onSetCaptioningEnabled", l -> l.onSetCaptioningEnabled(enabled));
         }
 
         @Override
         public void onSetRepeatMode(int repeatMode) {
-            if (listener == null) return;
-            listener.onSetRepeatMode(repeatMode);
+            callListener("MediaSessionCallback.onSetRepeatMode", l -> l.onSetRepeatMode(repeatMode));
         }
 
         @Override
         public void onSetShuffleMode(int shuffleMode) {
-            if (listener == null) return;
-            listener.onSetShuffleMode(shuffleMode);
+            callListener("MediaSessionCallback.onSetShuffleMode", l -> l.onSetShuffleMode(shuffleMode));
         }
 
         @Override
         public void onCustomAction(String action, Bundle extras) {
-            if (listener == null) return;
-            if (CUSTOM_ACTION_STOP.equals(action)) {
-                listener.onStop();
-            } else if (CUSTOM_ACTION_FAST_FORWARD.equals(action)) {
-                listener.onFastForward();
-            } else if (CUSTOM_ACTION_REWIND.equals(action)) {
-                listener.onRewind();
-            } else {
-                listener.onCustomAction(action, extras);
-            }
+            callListener("MediaSessionCallback.onCustomAction", l -> {
+                if (CUSTOM_ACTION_STOP.equals(action)) {
+                    l.onStop();
+                } else if (CUSTOM_ACTION_FAST_FORWARD.equals(action)) {
+                    l.onFastForward();
+                } else if (CUSTOM_ACTION_REWIND.equals(action)) {
+                    l.onRewind();
+                } else {
+                    l.onCustomAction(action, extras);
+                }
+            });
         }
 
         @Override
         public void onSetRating(RatingCompat rating, Bundle extras) {
-            if (listener == null) return;
-            listener.onSetRating(rating, extras);
+            callListener("MediaSessionCallback.onSetRating", l -> l.onSetRating(rating, extras));
         }
 
         //
@@ -1362,8 +1412,8 @@ public class AudioService extends MediaBrowserServiceCompat {
         //
 
         public void onPlayMediaItem(final MediaDescriptionCompat description) {
-            if (listener == null) return;
-            listener.onPlayMediaItem(getMediaMetadata(description.getMediaId()));
+            callListener("MediaSessionCallback.onPlayMediaItem",
+                    l -> l.onPlayMediaItem(getMediaMetadata(description.getMediaId())));
         }
     }
 

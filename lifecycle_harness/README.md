@@ -72,7 +72,22 @@ media item's extras (`asyncErrorCount`, `lastAsyncError`), which the tests read 
 | `liveUpdatesWhilePlayingDoNotRetryARefusedStart` | API 31+. After a refusal, 20 live updates (seeks, still playing) make no further attempt, and Dart is still told only once |
 | `activityResumeRetriesARefusedStartOnce` | API 31+. After a refusal, pausing and resuming the Activity makes exactly one more attempt, which puts the service in the foreground with its wake lock and reports nothing to Dart |
 | `foregroundStartFailureReachesDartAndIsNotRetried` | `startForeground()` throws a plain `IllegalStateException`, as for a missing or invalid foreground service type. Dart gets the error; neither 20 live updates nor an Activity resume retry it; a pause followed by a new play tries once more |
-| `failedRetryOnActivityResumeIsLoggedNotThrown` | API 31+. After a refusal, the retry from the Activity's resume fails with a plain `IllegalStateException`. It is logged, not thrown into the lifecycle callback: the process survives, the service keeps playing without the playing state, Dart is not told, and the next resume does not retry. A pause followed by a new play tries once more and reports the failure to Dart |
+| `failedRetryOnActivityResumeIsReportedNotThrown` | API 31+. After a refusal, the retry from the Activity's resume fails with a plain `IllegalStateException`. It is reported, not thrown into the lifecycle callback: the process survives, the service keeps playing without the playing state, Dart gets it through `AudioService.asyncError` (code `AudioService.retryForegroundIfPlaying`), and the next resume does not retry. A pause followed by a new play tries once more and reports the failure to Dart |
+
+### `PlatformErrorTest`
+
+The plugin's unified error handling, `AudioServiceErrors.report()`: an error the plugin catches
+instead of letting it crash the app is logged to logcat and, while an AudioHandler's engine is
+attached, delivered to Dart's `AudioService.asyncError` as a `PlatformException` whose code names
+the method that caught it. The harness handler answers the children of `slow` after five seconds and
+throws for the children of `failing`.
+
+| Method | Checks |
+|---|---|
+| `reportedErrorsReachAsyncErrorFromAnyThread` | Errors reported on the main thread and on the instrumentation thread both reach `AudioService.asyncError`, with their `where` as the code |
+| `reportedErrorWithoutAnEngineIsOnlyLogged` | With no engine, reporting from either thread does not fail, and the error is not delivered to an engine created afterwards |
+| `failingBrowseRequestIsAnsweredWithAnError` | The handler's `getChildren` throws. The subscribing `MediaBrowser` gets `onError` and the process survives. This used to be answered with `Result.sendError()`, which `MediaBrowserServiceCompat` only supports for custom actions: the `UnsupportedOperationException` crashed the app |
+| `browseAnswerAfterServiceDestroyedIsReportedNotThrown` | `AudioService` is destroyed while the handler is still answering a `getChildren` request (the engine is kept alive). Building the answer needs the service; the failure used to crash the app on the main thread. It is logged as `AudioHandlerInterface.getChildren failed` and delivered to Dart (`handler_result method=onPlatformError outcome=success`) |
 
 ## Toolchain
 
@@ -122,8 +137,9 @@ replayed playing state re-enters the playing state (`foreground_retry reason=sta
 foreground start clears `playingStateEntered`, and the next resume of the attached Activity retries it.
 
 The five refusal and failure tests were added afterwards, together with making the foreground start
-all-or-nothing, and have not been run yet. They need the `foregroundPromoter` seam, so they do not
-compile against earlier revisions.
+all-or-nothing, and so were the four `PlatformErrorTest` tests, with the unified error handling.
+None of them has been run yet. They need the `foregroundPromoter` seam and `AudioServiceErrors`, so
+they do not compile against earlier revisions.
 
 ### Earlier runs
 
