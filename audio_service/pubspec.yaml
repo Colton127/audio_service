@@ -30,9 +30,13 @@ dependencies:
   #     ref: one-isolate
   #     path: audio_service_web
 
-  # Use these deps when publishing.
-  audio_service_platform_interface: ^0.1.1
-  audio_service_web: ^0.1.3
+  # This fork resolves its own sibling packages so that git consumers don't
+  # need dependency_overrides (the fork's platform interface adds
+  # androidStopForegroundOnCompleted, which isn't on pub.dev).
+  audio_service_platform_interface:
+    path: ../audio_service_platform_interface
+  audio_service_web:
+    path: ../audio_service_web
 
   audio_session: ^0.2.1
   rxdart: '>=0.26.0 <0.29.0'
