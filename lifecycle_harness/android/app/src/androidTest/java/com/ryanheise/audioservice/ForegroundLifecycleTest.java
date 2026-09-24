@@ -300,8 +300,8 @@ public class ForegroundLifecycleTest {
     /**
      * A retry runs from the Activity's lifecycle callback, where a thrown exception would crash the
      * app. A failure other than a refusal must be reported instead (logged and delivered to
-     * AudioService.asyncError), recorded so that later resumes do not retry it, and tried again by
-     * a new play.
+     * AudioService.asyncError as FOREGROUND_START_FAILED), recorded so that later resumes do not
+     * retry it, and tried again by a new play.
      */
     @Test
     public void failedRetryOnActivityResumeIsReportedNotThrown() throws Exception {
@@ -324,7 +324,7 @@ public class ForegroundLifecycleTest {
         assertFalse("A failed retry must not leave the wake lock held", service.isWakeLockHeld());
         await("The failed retry did not reach AudioService.asyncError",
                 () -> asyncErrorCount(controller) == 2, TIMEOUT_MS);
-        assertEquals("AudioService.retryForegroundIfPlaying", lastAsyncError(controller));
+        assertEquals(AudioService.FOREGROUND_START_FAILED, lastAsyncError(controller));
 
         pauseAndResumeActivity();
         assertEquals("A failed retry must not be retried by the next resume", 2, promoter.attempts.get());
@@ -332,14 +332,15 @@ public class ForegroundLifecycleTest {
         pause(controller);
         play(controller);
         await("The failure of the new play did not reach Dart", () -> asyncErrorCount(controller) == 3, TIMEOUT_MS);
-        assertEquals(SIMULATED_FAILURE, lastAsyncError(controller));
+        assertEquals(AudioService.FOREGROUND_START_FAILED, lastAsyncError(controller));
         assertEquals("A new play must try again, once", 3, promoter.attempts.get());
     }
 
     /**
      * Any other failure, such as the IllegalStateException subclasses Android 14+ throws for a
-     * missing or invalid foreground service type, is a configuration error. It must reach Dart and
-     * must not be retried by live updates or an Activity resume; only a new play tries again.
+     * missing or invalid foreground service type, is a configuration error. It must reach Dart, as
+     * FOREGROUND_START_FAILED whatever the exception, and must not be retried by live updates or an
+     * Activity resume; only a new play tries again.
      */
     @Test
     public void foregroundStartFailureReachesDartAndIsNotRetried() throws Exception {
@@ -347,7 +348,7 @@ public class ForegroundLifecycleTest {
         final MediaControllerCompat controller = launchAndAwaitHandler();
         play(controller);
         await("The failure did not reach Dart", () -> asyncErrorCount(controller) == 1, TIMEOUT_MS);
-        assertEquals(SIMULATED_FAILURE, lastAsyncError(controller));
+        assertEquals(AudioService.FOREGROUND_START_FAILED, lastAsyncError(controller));
         assertEquals(1, promoter.attempts.get());
         assertFalse("A failed start must not leave the playing state entered",
                 AudioService.instance.isPlayingStateEntered());
@@ -490,6 +491,56 @@ public class ForegroundLifecycleTest {
         await("Stopping did not take the recreated AudioService out of the foreground",
                 () -> !second.isInForeground() && !isAudioServiceStartedInForeground(), TIMEOUT_MS);
         assertEquals(Collections.singletonList(stop("REMOVE", second)), promoter.stops);
+    }
+
+    /**
+     * Android 12L lets startForegroundService() through and refuses startForeground(), which leaves
+     * the service started: without a rollback it would outlive its bindings, playing without a
+     * foreground service until Android stops it (observed: about a minute after the app left the
+     * foreground). The refusal must undo the start, so the service lives only as long as its
+     * bindings, as after a refusal of the first phase. It is still retried when the Activity
+     * resumes.
+     */
+    @Test
+    public void refusalAfterStartUndoesTheStart() throws Exception {
+        assumeTrue("ForegroundServiceStartNotAllowedException needs API 31", Build.VERSION.SDK_INT >= 31);
+        final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.START_THEN_REFUSE);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        final AudioService service = AudioService.instance;
+        play(controller);
+        await("The refusal was not reported to Dart", () -> asyncErrorCount(controller) == 1, TIMEOUT_MS);
+        assertEquals(AudioService.FOREGROUND_START_REFUSED, lastAsyncError(controller));
+        assertFalse(service.isPlayingStateEntered());
+        await("The refused start was not undone", () -> !isAudioServiceStarted(), TIMEOUT_MS);
+        assertFalse("Android must not be left waiting for startForeground()",
+                shell("dumpsys activity services " + context.getPackageName()).contains("fgRequired=true"));
+
+        promoter.mode = ScriptedPromoter.Mode.ALLOW;
+        pauseAndResumeActivity();
+        await("The resumed Activity did not bring the playing AudioService into the foreground",
+                () -> service.isPlayingStateEntered() && isAudioServiceStartedInForeground(),
+                FOREGROUND_DEADLINE_MS);
+        promoter.mode = ScriptedPromoter.Mode.START_THEN_REFUSE;
+        pause(controller);
+        play(controller);
+        // The service was already started by the retry, so this refusal has no start to undo.
+        await("The second refusal was not reported to Dart", () -> asyncErrorCount(controller) == 2, TIMEOUT_MS);
+        assertTrue("A start this attempt did not make must not be undone", isAudioServiceStarted());
+    }
+
+    /**
+     * The last binding going after a refusal that undid the start destroys the service, as after a
+     * refusal of the first phase.
+     */
+    @Test
+    public void serviceWhoseRefusedStartWasUndoneEndsWithItsBindings() throws Exception {
+        assumeTrue("ForegroundServiceStartNotAllowedException needs API 31", Build.VERSION.SDK_INT >= 31);
+        installPromoter(ScriptedPromoter.Mode.START_THEN_REFUSE);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        play(controller);
+        await("The refusal was not reported to Dart", () -> asyncErrorCount(controller) == 1, TIMEOUT_MS);
+        closeActivity();
+        await("AudioService outlived its last binding", () -> AudioService.instance == null, TIMEOUT_MS);
     }
 
     /**
@@ -642,14 +693,16 @@ public class ForegroundLifecycleTest {
      * a missing or invalid foreground service type. Neither makes a framework call; ALLOW makes the
      * real calls.
      *
-     * <p>A real refusal cannot be reproduced here (the instrumented process counts as foreground)
-     * nor faithfully simulated: making the real startForegroundService() and then throwing instead
-     * of calling startForeground() would leave Android waiting for startForeground(), which a real
-     * refusal does not (Android clears that wait inside startForeground() before refusing). Real
-     * refusals, in either phase, are covered by ReliefMix's host runner on API 32 and 36.</p>
+     * <p>A real refusal cannot be reproduced here: the instrumented process counts as foreground.
+     * START_THEN_REFUSE leaves Android in the state of Android 12L's refusal of the second phase:
+     * the real startForegroundService() goes through, so the service is started, and the second
+     * phase refuses without leaving Android waiting for startForeground() (a real refusal clears
+     * that wait first). It does so with the real startForeground() and an immediate
+     * stopForeground(), so the service is briefly in the foreground. Real refusals, in either
+     * phase, are covered by ReliefMix's host runner on API 32 and 36.</p>
      */
     private static final class ScriptedPromoter implements AudioService.ForegroundPromoter {
-        enum Mode { ALLOW, REFUSE, FAIL }
+        enum Mode { ALLOW, REFUSE, START_THEN_REFUSE, FAIL }
 
         volatile Mode mode;
         final AtomicInteger attempts = new AtomicInteger();
@@ -661,7 +714,7 @@ public class ForegroundLifecycleTest {
         @Override
         public void startForegroundService(AudioService service) {
             attempts.incrementAndGet();
-            if (mode == Mode.ALLOW) {
+            if (mode == Mode.ALLOW || mode == Mode.START_THEN_REFUSE) {
                 AudioService.FRAMEWORK_FOREGROUND_PROMOTER.startForegroundService(service);
             }
         }
@@ -674,6 +727,10 @@ public class ForegroundLifecycleTest {
                     break;
                 case REFUSE:
                     throw new ForegroundServiceStartNotAllowedException("simulated background start refusal");
+                case START_THEN_REFUSE:
+                    AudioService.FRAMEWORK_FOREGROUND_PROMOTER.startForeground(service, id, notification);
+                    AudioService.FRAMEWORK_FOREGROUND_PROMOTER.stopForeground(service, Service.STOP_FOREGROUND_REMOVE);
+                    throw new ForegroundServiceStartNotAllowedException("simulated refusal of startForeground()");
                 case FAIL:
                     throw new IllegalStateException(SIMULATED_FAILURE);
             }
@@ -739,6 +796,18 @@ public class ForegroundLifecycleTest {
             InstrumentationRegistry.getInstrumentation().getUiAutomation()
                     .grantRuntimePermission(context.getPackageName(), Manifest.permission.POST_NOTIFICATIONS);
         }
+    }
+
+    /** Whether AudioService is started (by startService() or startForegroundService()). */
+    @SuppressWarnings("deprecation")
+    private boolean isAudioServiceStarted() {
+        final ActivityManager activityManager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+        for (ActivityManager.RunningServiceInfo info : activityManager.getRunningServices(Integer.MAX_VALUE)) {
+            if (AudioService.class.getName().equals(info.service.getClassName())) {
+                return info.started;
+            }
+        }
+        return false;
     }
 
     /** getRunningServices() is deprecated but still reports the caller's own services. */

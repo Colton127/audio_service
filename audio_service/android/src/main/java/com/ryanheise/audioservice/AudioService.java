@@ -347,6 +347,13 @@ public class AudioService extends MediaBrowserServiceCompat {
      * foreground with STOP_FOREGROUND_LEGACY keeps the notification.
      */
     private boolean inForeground;
+    /**
+     * Whether this instance asked Android to start it (startForegroundService())
+     * and has not stopped itself since: Android then keeps it alive with no
+     * binding left. Tracked so that a refused promotion undoes only a start that
+     * the same attempt made.
+     */
+    private boolean startRequested;
     /** Process-local counter of AudioService instances. Diagnostic only. */
     private static int serviceGenerationCounter;
     private final int serviceGeneration = ++serviceGenerationCounter;
@@ -403,6 +410,7 @@ public class AudioService extends MediaBrowserServiceCompat {
         shuffleMode = 0;
         notificationCreated = false;
         inForeground = false;
+        startRequested = false;
         playing = false;
         processingState = AudioProcessingState.idle;
         mediaSession = new MediaSessionCompat(this, "media-session");
@@ -481,6 +489,7 @@ public class AudioService extends MediaBrowserServiceCompat {
     public void stop() {
         log("service_stop_requested", "serviceGeneration=" + serviceGeneration);
         deactivateMediaSession();
+        startRequested = false;
         stopSelf();
     }
 
@@ -510,8 +519,16 @@ public class AudioService extends MediaBrowserServiceCompat {
         // notification still attached to it (ActiveServices.
         // bringDownServiceLocked), so the call would only be a blocking round
         // trip into system_server (RELIEFMIX-3R5).
-        releaseMediaSession();
+        // A failure here must not skip the rest: a stale instance would make
+        // the scheduled engine disposal take this service for a recreated one
+        // and keep the engine, and the wake lock must not outlive the service.
+        try {
+            releaseMediaSession();
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onDestroy", e);
+        }
         inForeground = false;
+        startRequested = false;
         releaseWakeLock();
         instance = null;
         notificationCreated = false;
@@ -930,15 +947,29 @@ public class AudioService extends MediaBrowserServiceCompat {
             if (refusal != null && REASON_STATE_REPLAY.equals(reason)) {
                 AudioServiceErrors.report(FOREGROUND_START_REFUSED, refusal);
             }
-        } catch (RuntimeException e) {
+        } catch (ForegroundStartFailedException e) {
             // enterPlayingState() recorded it as FAILED, so it is not retried
             // here again; a new play attempts it again from a live update.
+            AudioServiceErrors.report(FOREGROUND_START_FAILED, e.getCause());
+        } catch (RuntimeException e) {
             AudioServiceErrors.report("AudioService.retryForegroundIfPlaying", e);
         }
     }
 
     /** The error code with which a refused foreground start reaches Dart. */
     static final String FOREGROUND_START_REFUSED = "FOREGROUND_START_REFUSED";
+    /**
+     * The error code with which any other foreground start failure reaches
+     * Dart. Unlike a refusal it is not expected to go away by itself.
+     */
+    static final String FOREGROUND_START_FAILED = "FOREGROUND_START_FAILED";
+
+    /** A foreground start failed for a reason other than a refusal; see {@link #getCause()}. */
+    static final class ForegroundStartFailedException extends RuntimeException {
+        ForegroundStartFailedException(RuntimeException cause) {
+            super(cause.getClass().getName() + ": " + cause.getMessage(), cause);
+        }
+    }
     private static final String REASON_STATE_REPLAY = "state_replay";
 
     /**
@@ -949,8 +980,9 @@ public class AudioService extends MediaBrowserServiceCompat {
      * would only give Android a chance to refuse a foreground service this
      * instance already has. Returns the refusal if Android refused the start
      * from the background (Android 12+), which is retryable, and null on
-     * success; any other failure, such as a missing or invalid foreground
-     * service type, propagates.
+     * success. Any other failure, such as a missing or invalid foreground
+     * service type, propagates as a {@link ForegroundStartFailedException}. A
+     * start that this attempt made is undone on failure.
      */
     private RuntimeException enterPlayingState() {
         // Neither is a held resource. The session stays active while playing
@@ -962,12 +994,27 @@ public class AudioService extends MediaBrowserServiceCompat {
             log("foreground_start_skipped", "serviceGeneration=" + serviceGeneration
                     + " reason=already_in_foreground");
         } else {
+            final boolean wasStartRequested = startRequested;
+            boolean startedNow = false;
             try {
                 foregroundPromoter.startForegroundService(this);
+                startedNow = !wasStartRequested;
+                startRequested = true;
                 internalStartForeground();
             } catch (RuntimeException e) {
                 final String fields = "serviceGeneration=" + serviceGeneration
                         + " error=" + e.getClass().getSimpleName();
+                if (startedNow) {
+                    // Android 12L refuses startForeground() after
+                    // startForegroundService() went through, which left this
+                    // service started: it would outlive its bindings, playing
+                    // without a foreground service until Android stops it.
+                    // Undo that start, so that it lives as long as a refusal
+                    // of the first call would leave it (its bindings).
+                    startRequested = false;
+                    stopSelf();
+                    log("service_start_rolled_back", fields);
+                }
                 if (isForegroundServiceStartNotAllowed(e)) {
                     foregroundFailure = ForegroundFailure.REFUSED;
                     log("foreground_start_refused", fields);
@@ -975,7 +1022,7 @@ public class AudioService extends MediaBrowserServiceCompat {
                 }
                 foregroundFailure = ForegroundFailure.FAILED;
                 log("foreground_start_failed", fields);
-                throw e;
+                throw new ForegroundStartFailedException(e);
             }
         }
         // Last, so that a failure to take the wake lock leaves the playing

@@ -75,14 +75,16 @@ media item's extras (`asyncErrorCount`, `lastAsyncError`), which the tests read 
 | `refusedForegroundStartLeavesNothingHalfEstablished` | API 31+. `startForeground()` throws `ForegroundServiceStartNotAllowedException` after `startForegroundService()` went through. The service is left not in the playing state, without its wake lock or a foreground service, with its media session still active; Dart gets one `FOREGROUND_START_REFUSED` error |
 | `liveUpdatesWhilePlayingDoNotRetryARefusedStart` | API 31+. After a refusal, 20 live updates (seeks, still playing) make no further attempt, and Dart is still told only once |
 | `activityResumeRetriesARefusedStartOnce` | API 31+. After a refusal, pausing and resuming the Activity makes exactly one more attempt, which puts the service in the foreground with its wake lock and reports nothing to Dart |
-| `foregroundStartFailureReachesDartAndIsNotRetried` | `startForeground()` throws a plain `IllegalStateException`, as for a missing or invalid foreground service type. Dart gets the error; neither 20 live updates nor an Activity resume retry it; a pause followed by a new play tries once more |
-| `failedRetryOnActivityResumeIsReportedNotThrown` | API 31+. After a refusal, the retry from the Activity's resume fails with a plain `IllegalStateException`. It is reported, not thrown into the lifecycle callback: the process survives, the service keeps playing without the playing state, Dart gets it through `AudioService.asyncError` (code `AudioService.retryForegroundIfPlaying`), and the next resume does not retry. A pause followed by a new play tries once more and reports the failure to Dart |
+| `foregroundStartFailureReachesDartAndIsNotRetried` | `startForeground()` throws a plain `IllegalStateException`, as for a missing or invalid foreground service type. Dart gets it as `FOREGROUND_START_FAILED`; neither 20 live updates nor an Activity resume retry it; a pause followed by a new play tries once more |
+| `failedRetryOnActivityResumeIsReportedNotThrown` | API 31+. After a refusal, the retry from the Activity's resume fails with a plain `IllegalStateException`. It is reported, not thrown into the lifecycle callback: the process survives, the service keeps playing without the playing state, Dart gets it through `AudioService.asyncError` (code `FOREGROUND_START_FAILED`), and the next resume does not retry. A pause followed by a new play tries once more and reports the failure to Dart |
 | `idleLeavesForegroundOnceAndDestructionDoesNotStopAgain` | RELIEFMIX-3R5. Stopping the playing handler (idle) makes one `stopForeground(STOP_FOREGROUND_REMOVE)` and removes the notification; destroying the service afterwards makes no further `stopForeground()` call |
 | `pauseLeavesForegroundKeepingNotificationAndDestructionDoesNotStopAgain` | Pausing makes one `stopForeground(STOP_FOREGROUND_LEGACY)`, which keeps the notification while the service lives; destroying the service makes no further call, and the notification goes with it |
 | `destructionInForegroundLeavesTheForegroundToTheSystem` | A service destroyed while in the foreground makes no `stopForeground()` call; it ends up out of the foreground and its notification is removed |
 | `recreatedServiceTracksItsOwnForegroundState` | An instance destroyed in the foreground makes no call; its replacement, restored to playing and back in the foreground, leaves it with exactly one `STOP_FOREGROUND_REMOVE` of its own |
 | `refusedForegroundStartOnStateReplayIsReportedToDart` | API 31+. A service destroyed while playing is recreated by a `MediaBrowser`, with no Activity, and replays `playing`; its foreground start is refused. No live update reaches this instance, so the replay reports it: Dart gets one `FOREGROUND_START_REFUSED`, and there is no playing state, wake lock or foreground service |
 | `playAfterPauseKeepingForegroundReusesIt` | With `androidStopForegroundOnPause` false, a pause keeps the foreground service; the next play reuses it (`foreground_start_skipped reason=already_in_foreground`) with no second promotion, which the test would make fail, and takes the wake lock |
+| `refusalAfterStartUndoesTheStart` | API 31+. `START_THEN_REFUSE`: the real `startForegroundService()` goes through and `startForeground()` refuses, as on Android 12L. The refusal undoes the start (`service_start_rolled_back`): the service is no longer started, and Android is not left waiting for `startForeground()`; the Activity's resume still retries. A later refusal after a start that attempt did not make undoes nothing |
+| `serviceWhoseRefusedStartWasUndoneEndsWithItsBindings` | API 31+. After such a refusal, the service is destroyed with its last binding (the Activity closing), as after a refusal of the first phase |
 
 The stop tests grant `POST_NOTIFICATIONS` on API 33+ (declared in the harness manifest) so that
 they can check the notification, and record `stopForeground()` calls through the same seam.
@@ -133,6 +135,20 @@ The debug APK is about 170 MB. If installation fails with `INSTALL_FAILED_INSUFF
 run `adb shell pm trim-caches 2G` or free space on the emulator.
 
 ## Results
+
+### Second review: rollback, `FOREGROUND_START_FAILED`, `onDestroy()` cleanup
+
+Measured first on API 32 with ReliefMix: after a real refusal of `startForeground()`, the service
+stayed started and non-foreground and audio kept playing after the Activity finished, until Android
+stopped the service about 35 s later (about a minute after the app left the foreground). The refusal
+now undoes a start the same attempt made, so the service lives as long as its bindings on every API.
+
+`26 tests, 0 failed` on the SM-S948U (API 36) and the `android12` AVD (API 32), run in parallel; on the
+VS995 (API 26) 19 pass and the 7 API 31+ tests skip. With the rollback undone,
+`refusalAfterStartUndoesTheStart` fails with `The refused start was not undone` and
+`serviceWhoseRefusedStartWasUndoneEndsWithItsBindings` with `AudioService outlived its last binding`.
+The `onDestroy()` cleanup change has no test: nothing in the harness can make the media session's
+release throw.
 
 ### Review fixes: 24 tests on three devices in parallel
 

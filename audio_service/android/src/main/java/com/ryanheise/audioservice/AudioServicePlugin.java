@@ -1312,6 +1312,12 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                     break;
                 }
                 }
+            } catch (AudioService.ForegroundStartFailedException e) {
+                // A live state update whose foreground start failed: a stable
+                // code, as for a refusal, so that apps can tell the two apart.
+                AudioServiceErrors.log("AudioHandlerInterface." + call.method, e.getCause());
+                result.error(AudioService.FOREGROUND_START_FAILED, e.getMessage(),
+                        Log.getStackTraceString(e.getCause()));
             } catch (Exception e) {
                 // Answered with the error, which Dart adds to AudioService.asyncError.
                 AudioServiceErrors.log("AudioHandlerInterface." + call.method, e);
