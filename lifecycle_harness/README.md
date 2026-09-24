@@ -140,7 +140,14 @@ failed`, of which the 4 refusal tests that need `ForegroundServiceStartNotAllowe
 foreground and removes its notification before `onDestroy()` on Android 10, as RELIEFMIX-3R5's fix
 assumes. With `ea4ee28` reverted, the four stop tests fail there too, on their recorded calls. One
 attempt ANRed with the main thread in `FlutterJNI.onSurfaceCreated` (the emulator's GL stack, no
-plugin code on the stack) and passed when run again. Not yet run on API 31–33.
+plugin code on the stack) and passed when run again.
+
+Android 12L / API 32 (AVD `android12`, x86_64): `22 tests, 0 failed`, none skipped. Reverting
+`ea4ee28` fails the four stop tests and reverting `cc2bf21` fails the five refusal and failure tests,
+as on API 36. In ReliefMix on this API, a real background refusal comes from `startForeground()`
+after `startForegroundService()` went through, which is the case `ScriptedPromoter`'s REFUSE mode
+simulates; Android left nothing `fgRequired`. On API 36 `startForegroundService()` itself is
+refused. Not run on API 31 or 33.
 
 After one test fix; on the emulator's first run 20 passed:
 `liveUpdatesWhilePlayingDoNotRetryARefusedStart` and `foregroundStartFailureReachesDartAndIsNotRetried`
