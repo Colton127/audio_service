@@ -132,8 +132,15 @@ run `adb shell pm trim-caches 2G` or free space on the emulator.
 
 Devices: `emulator-5554`, AVD `Phone_Screenshots`, and a Samsung SM-S948U (One UI), both Android 16 /
 API 36, Flutter 3.47.5. `22 tests, 0 failed` on both. On the Samsung too, the notification goes with
-the service without a `stopForeground()` call from `onDestroy()`. The foreground stop tests have not
-run on API 29 (RELIEFMIX-3R5 was on Android 10) or on API 31–33.
+the service without a `stopForeground()` call from `onDestroy()`.
+
+Android 10 / API 29 (AVD `android10`, x86_64; a 32-bit x86 image cannot run Flutter): `22 tests, 0
+failed`, of which the 4 refusal tests that need `ForegroundServiceStartNotAllowedException` skip
+(API 31+). All four stop tests pass, so the system also takes a destroyed service out of the
+foreground and removes its notification before `onDestroy()` on Android 10, as RELIEFMIX-3R5's fix
+assumes. With `ea4ee28` reverted, the four stop tests fail there too, on their recorded calls. One
+attempt ANRed with the main thread in `FlutterJNI.onSurfaceCreated` (the emulator's GL stack, no
+plugin code on the stack) and passed when run again. Not yet run on API 31–33.
 
 After one test fix; on the emulator's first run 20 passed:
 `liveUpdatesWhilePlayingDoNotRetryARefusedStart` and `foregroundStartFailureReachesDartAndIsNotRetried`
