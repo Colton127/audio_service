@@ -3,13 +3,17 @@ package com.ryanheise.audioservice;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
+import android.Manifest;
 import android.app.ActivityManager;
 import android.app.ForegroundServiceStartNotAllowedException;
 import android.app.Notification;
+import android.app.NotificationManager;
+import android.app.Service;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -19,6 +23,7 @@ import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.os.SystemClock;
+import android.service.notification.StatusBarNotification;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaControllerCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
@@ -41,7 +46,10 @@ import org.junit.runner.RunWith;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -345,6 +353,134 @@ public class ForegroundLifecycleTest {
         assertEquals("A new play must try again, once", 2, promoter.attempts.get());
     }
 
+    /**
+     * RELIEFMIX-3R5. Stopping a playing handler (idle) leaves the foreground once, removing the
+     * notification. The service is then destroyed without another stopForeground() call: a
+     * blocking call into system_server, which ignores it for a service not in the foreground.
+     */
+    @Test
+    public void idleLeavesForegroundOnceAndDestructionDoesNotStopAgain() throws Exception {
+        grantNotificationPermission();
+        final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.ALLOW);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        final AudioService service = AudioService.instance;
+        play(controller);
+        await("AudioService did not enter its playing foreground state",
+                () -> service.isInForeground() && isAudioServiceStartedInForeground() && isNotificationShown(),
+                TIMEOUT_MS);
+
+        // BaseAudioHandler.stop() publishes idle without clearing playing, so the idle transition
+        // is what leaves the foreground.
+        runOnMain(() -> {
+            controller.getTransportControls().stop();
+            return null;
+        });
+        await("Stopping the handler did not take AudioService out of the foreground",
+                () -> !service.isInForeground() && !isAudioServiceStartedInForeground(), TIMEOUT_MS);
+        assertEquals(Collections.singletonList(stop("REMOVE", service)), promoter.stops);
+        await("The notification was not removed", () -> !isNotificationShown(), TIMEOUT_MS);
+
+        closeActivity();
+        await("AudioService was not destroyed", () -> AudioService.instance == null, TIMEOUT_MS);
+        assertEquals("onDestroy() must not call stopForeground() again",
+                Collections.singletonList(stop("REMOVE", service)), promoter.stops);
+    }
+
+    /**
+     * Pausing leaves the foreground with STOP_FOREGROUND_LEGACY, which keeps the notification while
+     * the service lives. Destroying the service later makes no second stopForeground() call, and the
+     * notification still goes with the service.
+     */
+    @Test
+    public void pauseLeavesForegroundKeepingNotificationAndDestructionDoesNotStopAgain() throws Exception {
+        grantNotificationPermission();
+        final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.ALLOW);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        final AudioService service = AudioService.instance;
+        play(controller);
+        await("AudioService did not enter its playing foreground state",
+                () -> service.isInForeground() && isAudioServiceStartedInForeground() && isNotificationShown(),
+                TIMEOUT_MS);
+
+        // The harness keeps the default androidStopForegroundOnPause (true).
+        pause(controller);
+        await("Pausing did not take AudioService out of the foreground",
+                () -> !service.isInForeground() && !isAudioServiceStartedInForeground(), TIMEOUT_MS);
+        assertEquals(Collections.singletonList(stop("LEGACY", service)), promoter.stops);
+        assertTrue("STOP_FOREGROUND_LEGACY must keep the notification while the service lives",
+                isNotificationShown());
+
+        closeActivity();
+        assertSame("A started AudioService must survive its Activity closing", service, AudioService.instance);
+        context.stopService(new Intent(context, AudioService.class));
+        await("AudioService was not destroyed", () -> AudioService.instance == null, TIMEOUT_MS);
+        assertEquals("onDestroy() must not call stopForeground() again",
+                Collections.singletonList(stop("LEGACY", service)), promoter.stops);
+        await("The notification was not removed with the service", () -> !isNotificationShown(), TIMEOUT_MS);
+    }
+
+    /**
+     * A service destroyed while still in the foreground makes no stopForeground() call: the system
+     * takes it out of the foreground and cancels its notification before calling onDestroy().
+     */
+    @Test
+    public void destructionInForegroundLeavesTheForegroundToTheSystem() throws Exception {
+        grantNotificationPermission();
+        final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.ALLOW);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        final AudioService service = AudioService.instance;
+        play(controller);
+        await("AudioService did not enter its playing foreground state",
+                () -> service.isInForeground() && isAudioServiceStartedInForeground() && isNotificationShown(),
+                TIMEOUT_MS);
+
+        closeActivity();
+        assertSame("A playing AudioService must survive its Activity closing", service, AudioService.instance);
+        context.stopService(new Intent(context, AudioService.class));
+        await("AudioService was not destroyed", () -> AudioService.instance == null, TIMEOUT_MS);
+        assertEquals("onDestroy() must not call stopForeground()", Collections.emptyList(), promoter.stops);
+        assertFalse("The destroyed service must not be left in the foreground", isAudioServiceStartedInForeground());
+        await("The notification was not removed with the service", () -> !isNotificationShown(), TIMEOUT_MS);
+    }
+
+    /**
+     * Foreground state belongs to each service instance. An instance destroyed in the foreground
+     * makes no call; the instance that replaces it (restored to playing, so back in the foreground)
+     * leaves the foreground itself, exactly once.
+     */
+    @Test
+    public void recreatedServiceTracksItsOwnForegroundState() throws Exception {
+        grantNotificationPermission();
+        final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.ALLOW);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        final AudioService first = AudioService.instance;
+        play(controller);
+        await("AudioService did not enter its playing foreground state",
+                () -> first.isInForeground() && isAudioServiceStartedInForeground(), TIMEOUT_MS);
+        closeActivity();
+        context.stopService(new Intent(context, AudioService.class));
+        await("AudioService was not destroyed", () -> AudioService.instance == null, TIMEOUT_MS);
+
+        scenario = ActivityScenario.launch(AudioServiceActivity.class);
+        await("AudioService was not recreated", () -> AudioService.instance != null && AudioService.instance != first,
+                TIMEOUT_MS);
+        final AudioService second = AudioService.instance;
+        await("The recreated AudioService did not return to the foreground",
+                () -> second.isInForeground() && isAudioServiceStartedInForeground(), FOREGROUND_DEADLINE_MS);
+        assertEquals("The destroyed instance must not have called stopForeground()",
+                Collections.emptyList(), promoter.stops);
+
+        final MediaControllerCompat secondController =
+                runOnMain(() -> new MediaControllerCompat(context, second.getSessionToken()));
+        runOnMain(() -> {
+            secondController.getTransportControls().stop();
+            return null;
+        });
+        await("Stopping did not take the recreated AudioService out of the foreground",
+                () -> !second.isInForeground() && !isAudioServiceStartedInForeground(), TIMEOUT_MS);
+        assertEquals(Collections.singletonList(stop("REMOVE", second)), promoter.stops);
+    }
+
     private static ScriptedPromoter installPromoter(ScriptedPromoter.Mode mode) {
         final ScriptedPromoter promoter = new ScriptedPromoter(mode);
         AudioService.foregroundPromoter = promoter;
@@ -439,6 +575,28 @@ public class ForegroundLifecycleTest {
                     throw new IllegalStateException(SIMULATED_FAILURE);
             }
         }
+
+        /** Every stopForeground() call, as "<flags>@<serviceGeneration>" (see {@link #stop}). */
+        final List<String> stops = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void stopForeground(AudioService service, int flags) {
+            stops.add(stop(flagsName(flags), service));
+            AudioService.FRAMEWORK_FOREGROUND_PROMOTER.stopForeground(service, flags);
+        }
+
+        private static String flagsName(int flags) {
+            switch (flags) {
+                case Service.STOP_FOREGROUND_REMOVE: return "REMOVE";
+                case Service.STOP_FOREGROUND_DETACH: return "DETACH";
+                case Service.STOP_FOREGROUND_LEGACY: return "LEGACY";
+                default: return "flags=" + flags;
+            }
+        }
+    }
+
+    private static String stop(String flags, AudioService service) {
+        return flags + "@" + service.getServiceGeneration();
     }
 
     /** Launches the Activity and waits until the harness handler has published its media item. */
@@ -461,6 +619,23 @@ public class ForegroundLifecycleTest {
 
     private static Object cachedEngine() {
         return FlutterEngineCache.getInstance().get(AudioServicePlugin.getFlutterEngineId());
+    }
+
+    /** Whether AudioService's notification is posted. Needs the notification permission on API 33+. */
+    private boolean isNotificationShown() {
+        final NotificationManager notificationManager =
+                (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        for (StatusBarNotification notification : notificationManager.getActiveNotifications()) {
+            if (notification.getId() == AudioService.NOTIFICATION_ID) return true;
+        }
+        return false;
+    }
+
+    private void grantNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                    .grantRuntimePermission(context.getPackageName(), Manifest.permission.POST_NOTIFICATIONS);
+        }
     }
 
     /** getRunningServices() is deprecated but still reports the caller's own services. */

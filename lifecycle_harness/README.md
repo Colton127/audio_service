@@ -73,6 +73,16 @@ media item's extras (`asyncErrorCount`, `lastAsyncError`), which the tests read 
 | `activityResumeRetriesARefusedStartOnce` | API 31+. After a refusal, pausing and resuming the Activity makes exactly one more attempt, which puts the service in the foreground with its wake lock and reports nothing to Dart |
 | `foregroundStartFailureReachesDartAndIsNotRetried` | `startForeground()` throws a plain `IllegalStateException`, as for a missing or invalid foreground service type. Dart gets the error; neither 20 live updates nor an Activity resume retry it; a pause followed by a new play tries once more |
 | `failedRetryOnActivityResumeIsReportedNotThrown` | API 31+. After a refusal, the retry from the Activity's resume fails with a plain `IllegalStateException`. It is reported, not thrown into the lifecycle callback: the process survives, the service keeps playing without the playing state, Dart gets it through `AudioService.asyncError` (code `AudioService.retryForegroundIfPlaying`), and the next resume does not retry. A pause followed by a new play tries once more and reports the failure to Dart |
+| `idleLeavesForegroundOnceAndDestructionDoesNotStopAgain` | RELIEFMIX-3R5. Stopping the playing handler (idle) makes one `stopForeground(STOP_FOREGROUND_REMOVE)` and removes the notification; destroying the service afterwards makes no further `stopForeground()` call |
+| `pauseLeavesForegroundKeepingNotificationAndDestructionDoesNotStopAgain` | Pausing makes one `stopForeground(STOP_FOREGROUND_LEGACY)`, which keeps the notification while the service lives; destroying the service makes no further call, and the notification goes with it |
+| `destructionInForegroundLeavesTheForegroundToTheSystem` | A service destroyed while in the foreground makes no `stopForeground()` call; it ends up out of the foreground and its notification is removed |
+| `recreatedServiceTracksItsOwnForegroundState` | An instance destroyed in the foreground makes no call; its replacement, restored to playing and back in the foreground, leaves it with exactly one `STOP_FOREGROUND_REMOVE` of its own |
+
+The stop tests grant `POST_NOTIFICATIONS` on API 33+ (declared in the harness manifest) so that
+they can check the notification, and record `stopForeground()` calls through the same seam.
+`onDestroy()` makes no `stopForeground()` call: before calling it, the system has already taken the
+service out of the foreground and cancelled a notification still attached to it
+(`ActiveServices.bringDownServiceLocked`).
 
 ### `PlatformErrorTest`
 
@@ -137,8 +147,8 @@ replayed playing state re-enters the playing state (`foreground_retry reason=sta
 foreground start clears `playingStateEntered`, and the next resume of the attached Activity retries it.
 
 The five refusal and failure tests were added afterwards, together with making the foreground start
-all-or-nothing, and so were the four `PlatformErrorTest` tests, with the unified error handling.
-None of them has been run yet. They need the `foregroundPromoter` seam and `AudioServiceErrors`, so
+all-or-nothing, and so were the four `PlatformErrorTest` tests, with the unified error handling, and
+the four foreground stop tests. None of them has been run yet. They need the `foregroundPromoter` seam and `AudioServiceErrors`, so
 they do not compile against earlier revisions.
 
 ### Earlier runs

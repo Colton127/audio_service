@@ -63,7 +63,7 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     private static final String SHARED_PREFERENCES_NAME = "audio_service_preferences";
 
-    private static final int NOTIFICATION_ID = 1124;
+    static final int NOTIFICATION_ID = 1124;
     private static final int REQUEST_CONTENT_INTENT = 1000;
     public static final String NOTIFICATION_CLICK_ACTION = "com.ryanheise.audioservice.NOTIFICATION_CLICK";
     public static final String CUSTOM_ACTION_STOP = "com.ryanheise.audioservice.action.STOP";
@@ -338,6 +338,15 @@ public class AudioService extends MediaBrowserServiceCompat {
     private int repeatMode;
     private int shuffleMode;
     private boolean notificationCreated;
+    /**
+     * Whether this instance is a foreground service: set once startForeground()
+     * has succeeded, cleared when it leaves the foreground. stopForeground() is
+     * a blocking call into system_server, which ignores it for a service that
+     * is not in the foreground, so it is only made when there is a foreground
+     * state to leave. Distinct from {@link #notificationCreated}: leaving the
+     * foreground with STOP_FOREGROUND_LEGACY keeps the notification.
+     */
+    private boolean inForeground;
     /** Process-local counter of AudioService instances. Diagnostic only. */
     private static int serviceGenerationCounter;
     private final int serviceGeneration = ++serviceGenerationCounter;
@@ -367,6 +376,11 @@ public class AudioService extends MediaBrowserServiceCompat {
         return wakeLock.isHeld();
     }
 
+    /** Diagnostic only: whether this instance is a foreground service. */
+    boolean isInForeground() {
+        return inForeground;
+    }
+
     /** Diagnostic only: whether this instance's media session is active. */
     boolean isMediaSessionActive() {
         return mediaSession != null && mediaSession.isActive();
@@ -388,6 +402,7 @@ public class AudioService extends MediaBrowserServiceCompat {
         repeatMode = 0;
         shuffleMode = 0;
         notificationCreated = false;
+        inForeground = false;
         playing = false;
         processingState = AudioProcessingState.idle;
         mediaSession = new MediaSessionCompat(this, "media-session");
@@ -473,7 +488,8 @@ public class AudioService extends MediaBrowserServiceCompat {
     public void onDestroy() {
         log("service_destroy_begin", "serviceGeneration=" + serviceGeneration
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
-                + " engineHash=" + hashOf(flutterEngine));
+                + " engineHash=" + hashOf(flutterEngine)
+                + " inForeground=" + inForeground);
         super.onDestroy();
         // The listener (the plugin's AudioHandlerInterface) belongs to the
         // shared FlutterEngine, which outlives this service instance. It stays
@@ -488,37 +504,38 @@ public class AudioService extends MediaBrowserServiceCompat {
         controls.clear();
         artBitmapCache.evictAll();
         compactActionIndices = null;
+        // releaseMediaSession() also cancels the notification. There is no
+        // stopForeground() here: before calling onDestroy() the system has
+        // already taken this service out of the foreground and cancelled a
+        // notification still attached to it (ActiveServices.
+        // bringDownServiceLocked), so the call would only be a blocking round
+        // trip into system_server (RELIEFMIX-3R5).
         releaseMediaSession();
-        legacyStopForeground(!config.androidResumeOnClick, "service_destroy");
-        // This still does not solve the Android 11 problem.
-        // if (notificationCreated) {
-        //     NotificationManager notificationManager = getNotificationManager();
-        //     notificationManager.cancel(NOTIFICATION_ID);
-        // }
+        inForeground = false;
         releaseWakeLock();
         instance = null;
         notificationCreated = false;
         log("service_destroy_end", "serviceGeneration=" + serviceGeneration);
     }
 
+    /**
+     * Leaves the foreground, removing the notification or keeping it attached
+     * to the service (STOP_FOREGROUND_LEGACY: the system still removes it when
+     * the service is destroyed, unlike STOP_FOREGROUND_DETACH). Skipped if the
+     * service is not in the foreground, e.g. already left on pause.
+     */
     private void legacyStopForeground(boolean removeNotification, String reason) {
         final String fields = "serviceGeneration=" + serviceGeneration
                 + " reason=" + reason + " removeNotification=" + removeNotification;
-        log("foreground_stop_requested", fields);
-        legacyStopForeground(removeNotification);
-        log("foreground_stopped", fields);
-    }
-
-    @SuppressWarnings("deprecation")
-    private void legacyStopForeground(boolean removeNotification) {
-        if (Build.VERSION.SDK_INT >= 24) {
-            // TODO: Consider application of STOP_FOREGROUND_DETACH
-            stopForeground(removeNotification ? STOP_FOREGROUND_REMOVE : 0);
-        } else {
-            // TODO: This API is deprecated and we'll need to eventually
-            // delete this line.
-            stopForeground(removeNotification);
+        if (!inForeground) {
+            log("foreground_stop_skipped", fields);
+            return;
         }
+        log("foreground_stop_requested", fields);
+        inForeground = false;
+        foregroundPromoter.stopForeground(this,
+                removeNotification ? STOP_FOREGROUND_REMOVE : STOP_FOREGROUND_LEGACY);
+        log("foreground_stopped", fields);
     }
 
     public AudioServiceConfig getConfig() {
@@ -969,13 +986,17 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     /**
-     * The two framework calls that put the service in the foreground. Tests
-     * replace {@link #foregroundPromoter} to make them fail as Android would.
+     * The framework calls that put the service in the foreground and take it
+     * out. Tests replace {@link #foregroundPromoter} to make them fail as
+     * Android would, or to observe them.
      */
     interface ForegroundPromoter {
         void startForegroundService(AudioService service);
 
         void startForeground(AudioService service, int id, Notification notification);
+
+        /** @param flags STOP_FOREGROUND_REMOVE or STOP_FOREGROUND_LEGACY */
+        void stopForeground(AudioService service, int flags);
     }
 
     static final ForegroundPromoter FRAMEWORK_FOREGROUND_PROMOTER = new ForegroundPromoter() {
@@ -987,6 +1008,16 @@ public class AudioService extends MediaBrowserServiceCompat {
         @Override
         public void startForeground(AudioService service, int id, Notification notification) {
             service.startForeground(id, notification);
+        }
+
+        @Override
+        @SuppressWarnings("deprecation")
+        public void stopForeground(AudioService service, int flags) {
+            if (Build.VERSION.SDK_INT >= 24) {
+                service.stopForeground(flags);
+            } else {
+                service.stopForeground((flags & STOP_FOREGROUND_REMOVE) != 0);
+            }
         }
     };
 
@@ -1010,6 +1041,7 @@ public class AudioService extends MediaBrowserServiceCompat {
         log("foreground_start_requested", fields);
         foregroundPromoter.startForeground(this, NOTIFICATION_ID, buildNotification());
         log("foreground_started", fields);
+        inForeground = true;
         notificationCreated = true;
     }
 
