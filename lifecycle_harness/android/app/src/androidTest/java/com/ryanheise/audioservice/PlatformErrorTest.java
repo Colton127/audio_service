@@ -139,8 +139,10 @@ public class PlatformErrorTest {
 
     /**
      * The Dart handler's getChildren throws. The request used to be answered with
-     * Result.sendError(), which MediaBrowserServiceCompat only supports for custom actions: the
-     * UnsupportedOperationException crashed the app. The client must get an error instead.
+     * Result.sendError(), which MediaBrowserServiceCompat only supports for custom actions. The
+     * UnsupportedOperationException did not crash the app (Flutter's MethodChannel logs an
+     * exception thrown by a reply handler), but the request was never answered, leaving the client
+     * waiting. The client must get an error instead.
      */
     @Test
     public void failingBrowseRequestIsAnsweredWithAnError() throws Exception {
@@ -165,8 +167,9 @@ public class PlatformErrorTest {
 
     /**
      * Dart answers a browse request after AudioService was destroyed. Building the answer's media
-     * items needs the service, so this used to throw on the main thread when the answer arrived,
-     * crashing the app. It must be reported instead, and reach Dart.
+     * items needs the service, so this used to throw a NullPointerException when the answer
+     * arrived, which Flutter's MethodChannel only logged: the request was left unanswered and Dart
+     * never heard of it. It must be reported instead, and reach Dart.
      */
     @Test
     public void browseAnswerAfterServiceDestroyedIsReportedNotThrown() throws Exception {

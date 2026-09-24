@@ -257,8 +257,9 @@ public class ForegroundLifecycleTest {
         sendLiveUpdates(controller);
 
         assertEquals("Live updates retried the refused start", 1, promoter.attempts.get());
-        assertFalse(AudioService.instance.isPlayingStateEntered());
-        assertFalse(AudioService.instance.isWakeLockHeld());
+        assertFalse("A refused start must not leave the playing state entered",
+                AudioService.instance.isPlayingStateEntered());
+        assertFalse("A refused start must not leave the wake lock held", AudioService.instance.isWakeLockHeld());
         assertHoldsFor("The refusal must be reported to Dart once",
                 () -> asyncErrorCount(controller) == 1, 1_000);
     }
@@ -310,8 +311,8 @@ public class ForegroundLifecycleTest {
         final AudioService service = AudioService.instance;
         assertNotNull("AudioService must survive a failed retry", service);
         assertTrue("The handler must still report playing", service.isPlaying());
-        assertFalse(service.isPlayingStateEntered());
-        assertFalse(service.isWakeLockHeld());
+        assertFalse("A failed retry must not leave the playing state entered", service.isPlayingStateEntered());
+        assertFalse("A failed retry must not leave the wake lock held", service.isWakeLockHeld());
         await("The failed retry did not reach AudioService.asyncError",
                 () -> asyncErrorCount(controller) == 2, TIMEOUT_MS);
         assertEquals("AudioService.retryForegroundIfPlaying", lastAsyncError(controller));
@@ -339,8 +340,9 @@ public class ForegroundLifecycleTest {
         await("The failure did not reach Dart", () -> asyncErrorCount(controller) == 1, TIMEOUT_MS);
         assertEquals(SIMULATED_FAILURE, lastAsyncError(controller));
         assertEquals(1, promoter.attempts.get());
-        assertFalse(AudioService.instance.isPlayingStateEntered());
-        assertFalse(AudioService.instance.isWakeLockHeld());
+        assertFalse("A failed start must not leave the playing state entered",
+                AudioService.instance.isPlayingStateEntered());
+        assertFalse("A failed start must not leave the wake lock held", AudioService.instance.isWakeLockHeld());
 
         sendLiveUpdates(controller);
         pauseAndResumeActivity();

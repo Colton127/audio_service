@@ -96,8 +96,8 @@ throws for the children of `failing`.
 |---|---|
 | `reportedErrorsReachAsyncErrorFromAnyThread` | Errors reported on the main thread and on the instrumentation thread both reach `AudioService.asyncError`, with their `where` as the code |
 | `reportedErrorWithoutAnEngineIsOnlyLogged` | With no engine, reporting from either thread does not fail, and the error is not delivered to an engine created afterwards |
-| `failingBrowseRequestIsAnsweredWithAnError` | The handler's `getChildren` throws. The subscribing `MediaBrowser` gets `onError` and the process survives. This used to be answered with `Result.sendError()`, which `MediaBrowserServiceCompat` only supports for custom actions: the `UnsupportedOperationException` crashed the app |
-| `browseAnswerAfterServiceDestroyedIsReportedNotThrown` | `AudioService` is destroyed while the handler is still answering a `getChildren` request (the engine is kept alive). Building the answer needs the service; the failure used to crash the app on the main thread. It is logged as `AudioHandlerInterface.getChildren failed` and delivered to Dart (`handler_result method=onPlatformError outcome=success`) |
+| `failingBrowseRequestIsAnsweredWithAnError` | The handler's `getChildren` throws. The subscribing `MediaBrowser` gets `onError` and the process survives. This used to be answered with `Result.sendError()`, which `MediaBrowserServiceCompat` only supports for custom actions. The `UnsupportedOperationException` did not crash the app (Flutter's `MethodChannel` logs an exception thrown by a reply handler) but left the request unanswered |
+| `browseAnswerAfterServiceDestroyedIsReportedNotThrown` | `AudioService` is destroyed while the handler is still answering a `getChildren` request (the engine is kept alive). Building the answer needs the service; the `NullPointerException` used to be logged by `MethodChannel` only, leaving the request unanswered and Dart uninformed. It is logged as `AudioHandlerInterface.getChildren failed` and delivered to Dart (`handler_result method=onPlatformError outcome=success`) |
 
 ## Toolchain
 
@@ -128,6 +128,58 @@ run `adb shell pm trim-caches 2G` or free space on the emulator.
 
 ## Results
 
+### `lifecycle-repro` @ `ea4ee28` + test fixes: first device run of all 22 tests
+
+Device: `emulator-5554`, AVD `Phone_Screenshots`, Android 16 / API 36, Flutter 3.47.5. The
+foreground stop tests have not run on API 29 or 31–33; only API 35/36 images were available, and the
+API 35 AVD did not boot.
+
+`22 tests, 0 failed`, after one test fix. On the first run 20 passed;
+`liveUpdatesWhilePlayingDoNotRetryARefusedStart` and `foregroundStartFailureReachesDartAndIsNotRetried`
+failed with `The live updates were not all applied`. They waited for `PlaybackState.getPosition()` to
+equal the last seek (20000 ms), but `MediaSessionRecord` extrapolates the position of a playing state
+for controllers (seen: `position=49973` after the 30 s wait). The harness `seek()` now also publishes
+the buffered position, which is not extrapolated, and the tests wait for that. The other assumptions
+held: `POST_NOTIFICATIONS` granted through `UiAutomation` lets `getActiveNotifications()` list id 1124;
+`moveToState(STARTED)`/`RESUMED` fires one `onActivityResumed`; relaunches land inside the 1 s window;
+a null browse result reaches the client as `onError`.
+
+Lifecycle log of the stop and refusal tests (`AudioServiceLifecycle`, abridged):
+
+```text
+started: pauseLeavesForegroundKeepingNotificationAndDestructionDoesNotStopAgain
+event=foreground_started serviceGeneration=4 reason=enter_playing_state
+event=foreground_stop_requested serviceGeneration=4 reason=exit_playing_state removeNotification=false
+event=service_destroy_begin serviceGeneration=4 inForeground=false
+started: destructionInForegroundLeavesTheForegroundToTheSystem
+event=foreground_started serviceGeneration=8 reason=enter_playing_state
+event=service_destroy_begin serviceGeneration=8 inForeground=true
+event=service_destroyed_while_playing generation=6 serviceGeneration=8 processingState=ready
+started: idleLeavesForegroundOnceAndDestructionDoesNotStopAgain
+event=foreground_stop_requested serviceGeneration=9 reason=processing_state_idle removeNotification=true
+event=service_destroy_begin serviceGeneration=9 inForeground=false
+started: activityResumeRetriesARefusedStartOnce
+event=foreground_start_refused serviceGeneration=16 error=ForegroundServiceStartNotAllowedException
+event=foreground_retry serviceGeneration=16 reason=activity_resumed
+event=foreground_started serviceGeneration=16 reason=enter_playing_state
+```
+
+`service_destroyed_while_playing` is also logged after an idle stop (`processingState=idle`), because
+`BaseAudioHandler.stop()` publishes idle without clearing `playing`. It is diagnostic only.
+
+Each fix was reverted locally (not committed) to check that its tests catch it:
+
+| Revert | Tests that fail |
+|---|---|
+| `ea4ee28`: `onDestroy()` calls `stopForeground()` again, unconditionally as before | All four stop tests, on their recorded calls, e.g. `onDestroy() must not call stopForeground() again expected:<[REMOVE@9]> but was:<[REMOVE@9, LEGACY@9]>`, and `destructionInForegroundLeavesTheForegroundToTheSystem`: `expected:<[]> but was:<[LEGACY@8]>` |
+| `cc2bf21`: playing flag and wake lock set before the foreground calls | All five refusal/failure tests, e.g. `A refused start must not leave the playing state entered`; `activityResumeRetriesARefusedStartOnce` never retries |
+| `c027986`: retry from the resume callback may throw | `failedRetryOnActivityResumeIsReportedNotThrown`: `FATAL EXCEPTION: main` in `AudioServicePlugin$3.onActivityResumed`, instrumentation process crashed |
+| `5f3beaf`: browse errors answered with `sendError()` | `failingBrowseRequestIsAnsweredWithAnError`: `The client was not told that loading the children failed`. No crash: `MethodChannel` logged `Failed to handle method call result` / `UnsupportedOperationException: It is not supported to send an error for failing` |
+| `5f3beaf`: no guard around building a `getChildren` answer | `browseAnswerAfterServiceDestroyedIsReportedNotThrown`: `The failure to build the answer was not reported`. No crash: `MethodChannel` logged the `NullPointerException` |
+
+So the browse fixes answer requests that were left pending; they did not fix a crash. Flutter's
+`MethodChannel.IncomingResultHandler` has caught exceptions from reply handlers since 2017.
+
 ### `lifecycle-repro` (on `minor` @ `4653312`)
 
 Device: `emulator-5554`, AVD `Phone_Screenshots`, Android 16 / API 36.
@@ -148,8 +200,8 @@ foreground start clears `playingStateEntered`, and the next resume of the attach
 
 The five refusal and failure tests were added afterwards, together with making the foreground start
 all-or-nothing, and so were the four `PlatformErrorTest` tests, with the unified error handling, and
-the four foreground stop tests. None of them has been run yet. They need the `foregroundPromoter` seam and `AudioServiceErrors`, so
-they do not compile against earlier revisions.
+the four foreground stop tests; see the next section for their first device run. They need the
+`foregroundPromoter` seam and `AudioServiceErrors`, so they do not compile against earlier revisions.
 
 ### Earlier runs
 

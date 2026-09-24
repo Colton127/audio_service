@@ -878,7 +878,8 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                     @Override
                     public void success(Object obj) {
                         // Runs when Dart answers, possibly after the service
-                        // was destroyed; nothing up the stack would catch.
+                        // was destroyed. MethodChannel would only log a
+                        // failure here, leaving the request unanswered.
                         try {
                             Map<?, ?> response = (Map<?, ?>)obj;
                             @SuppressWarnings("unchecked") List<Map<?, ?>> rawMediaItems = (List<Map<?, ?>>)response.get("children");
