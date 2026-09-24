@@ -56,10 +56,14 @@ This test was written on the fix branch and moved here from `audio_service/examp
 
 Checks that a playing handler ends up with a started, foreground `AudioService`, and that handler
 commands reach Dart. The instrumented process counts as foreground, so Android never refuses a
-foreground-service start here. The last five tests simulate refused and failed starts by replacing
-`AudioService.foregroundPromoter`, the seam around `startForegroundService()` and
-`startForeground()`; real refusals are covered by ReliefMix's host runner (`system_test/android`,
-`service` category). The harness handler counts errors that reach `AudioService.asyncError` in its
+foreground-service start here. Most tests replace `AudioService.foregroundPromoter`, the seam
+around `startForegroundService()`, `startForeground()` and `stopForeground()`, to simulate refused
+and failed starts or to record calls. A simulated refusal makes no framework call. Making the real
+`startForegroundService()` and then throwing instead of calling `startForeground()` would not be
+faithful: Android would keep waiting for `startForeground()`, while a real refusal clears that wait
+inside `startForeground()` first. Real refusals, which Android 12L raises from `startForeground()`
+and Android 16 from `startForegroundService()`, are covered by ReliefMix's host runner
+(`system_test/android`, `service` category). The harness handler counts errors that reach `AudioService.asyncError` in its
 media item's extras (`asyncErrorCount`, `lastAsyncError`), which the tests read through a
 `MediaController`.
 
@@ -77,6 +81,8 @@ media item's extras (`asyncErrorCount`, `lastAsyncError`), which the tests read 
 | `pauseLeavesForegroundKeepingNotificationAndDestructionDoesNotStopAgain` | Pausing makes one `stopForeground(STOP_FOREGROUND_LEGACY)`, which keeps the notification while the service lives; destroying the service makes no further call, and the notification goes with it |
 | `destructionInForegroundLeavesTheForegroundToTheSystem` | A service destroyed while in the foreground makes no `stopForeground()` call; it ends up out of the foreground and its notification is removed |
 | `recreatedServiceTracksItsOwnForegroundState` | An instance destroyed in the foreground makes no call; its replacement, restored to playing and back in the foreground, leaves it with exactly one `STOP_FOREGROUND_REMOVE` of its own |
+| `refusedForegroundStartOnStateReplayIsReportedToDart` | API 31+. A service destroyed while playing is recreated by a `MediaBrowser`, with no Activity, and replays `playing`; its foreground start is refused. No live update reaches this instance, so the replay reports it: Dart gets one `FOREGROUND_START_REFUSED`, and there is no playing state, wake lock or foreground service |
+| `playAfterPauseKeepingForegroundReusesIt` | With `androidStopForegroundOnPause` false, a pause keeps the foreground service; the next play reuses it (`foreground_start_skipped reason=already_in_foreground`) with no second promotion, which the test would make fail, and takes the wake lock |
 
 The stop tests grant `POST_NOTIFICATIONS` on API 33+ (declared in the harness manifest) so that
 they can check the notification, and record `stopForeground()` calls through the same seam.
@@ -127,6 +133,15 @@ The debug APK is about 170 MB. If installation fails with `INSTALL_FAILED_INSUFF
 run `adb shell pm trim-caches 2G` or free space on the emulator.
 
 ## Results
+
+### Review fixes: 24 tests on three devices in parallel
+
+`./gradlew :app:connectedDebugAndroidTest` with no `ANDROID_SERIAL` runs on every connected device at
+once. `24 tests, 0 failed` on the Samsung SM-S948U (API 36) and the `android12` AVD (API 32); on the
+LG VS995 (API 26) 19 pass and the 5 API 31+ refusal tests skip. With their fixes undone (the replay
+report and the reuse of a kept foreground service), `refusedForegroundStartOnStateReplayIsReportedToDart`
+fails with `The refused replay was not reported to Dart` and `playAfterPauseKeepingForegroundReusesIt`
+with `The play did not re-enter the playing state` (API 32).
 
 ### `lifecycle-repro` @ `ea4ee28` + test fixes: first device run of all 22 tests
 

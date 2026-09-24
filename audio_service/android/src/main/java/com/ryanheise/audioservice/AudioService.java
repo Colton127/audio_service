@@ -731,7 +731,7 @@ public class AudioService extends MediaBrowserServiceCompat {
             // further live update that would establish them.
             if (playing) {
                 activateMediaSession();
-                retryForegroundIfPlaying("state_replay");
+                retryForegroundIfPlaying(REASON_STATE_REPLAY);
             }
             return;
         }
@@ -742,7 +742,7 @@ public class AudioService extends MediaBrowserServiceCompat {
             // would not change Android's answer.
             if (!playingStateEntered
                     && (!wasPlaying || foregroundFailure == ForegroundFailure.NONE)
-                    && !enterPlayingState()) {
+                    && enterPlayingState() != null) {
                 foregroundRefusalUnreported = true;
             }
         } else {
@@ -915,16 +915,21 @@ public class AudioService extends MediaBrowserServiceCompat {
      * Enters the playing state if the handler reports playing but this
      * instance has not established it, at a point where Android is likely to
      * allow the foreground-service start (an Activity resumed, a state
-     * replay). A refusal is logged and left for the next such point. Any other
-     * failure is reported (see AudioServiceErrors) and not retried here until
-     * playback restarts. Never throws: it runs from lifecycle callbacks, where
-     * an exception would crash the app.
+     * replay). A refusal is logged and left for the next such point; a refused
+     * replay is also reported to Dart as FOREGROUND_START_REFUSED, since this
+     * instance's playing state reached Dart through no live update that could
+     * report it. Any other failure is reported (see AudioServiceErrors) and not
+     * retried here until playback restarts. Never throws: it runs from
+     * lifecycle callbacks, where an exception would crash the app.
      */
     void retryForegroundIfPlaying(String reason) {
         if (!playing || playingStateEntered || foregroundFailure == ForegroundFailure.FAILED) return;
         log("foreground_retry", "serviceGeneration=" + serviceGeneration + " reason=" + reason);
         try {
-            enterPlayingState();
+            final RuntimeException refusal = enterPlayingState();
+            if (refusal != null && REASON_STATE_REPLAY.equals(reason)) {
+                AudioServiceErrors.report(FOREGROUND_START_REFUSED, refusal);
+            }
         } catch (RuntimeException e) {
             // enterPlayingState() recorded it as FAILED, so it is not retried
             // here again; a new play attempts it again from a live update.
@@ -932,38 +937,54 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
     }
 
+    /** The error code with which a refused foreground start reaches Dart. */
+    static final String FOREGROUND_START_REFUSED = "FOREGROUND_START_REFUSED";
+    private static final String REASON_STATE_REPLAY = "state_replay";
+
     /**
      * Starts the service in the foreground and only then takes the wake lock
      * and marks the playing state entered, so a failure leaves nothing half
-     * established. Returns false if Android refused the start from the
-     * background (Android 12+), which is retryable; any other failure, such as
-     * a missing or invalid foreground service type, propagates.
+     * established. A service still in the foreground, as a pause leaves it
+     * when androidStopForegroundOnPause is false, is not promoted again: that
+     * would only give Android a chance to refuse a foreground service this
+     * instance already has. Returns the refusal if Android refused the start
+     * from the background (Android 12+), which is retryable, and null on
+     * success; any other failure, such as a missing or invalid foreground
+     * service type, propagates.
      */
-    private boolean enterPlayingState() {
+    private RuntimeException enterPlayingState() {
         // Neither is a held resource. The session stays active while playing
         // even if the start is refused, so that media buttons keep reaching
         // the handler; buildNotification() reads the session activity.
         activateMediaSession();
         mediaSession.setSessionActivity(contentIntent);
-        try {
-            foregroundPromoter.startForegroundService(this);
-            internalStartForeground();
-        } catch (RuntimeException e) {
-            final String fields = "serviceGeneration=" + serviceGeneration
-                    + " error=" + e.getClass().getSimpleName();
-            if (isForegroundServiceStartNotAllowed(e)) {
-                foregroundFailure = ForegroundFailure.REFUSED;
-                log("foreground_start_refused", fields);
-                return false;
+        if (inForeground) {
+            log("foreground_start_skipped", "serviceGeneration=" + serviceGeneration
+                    + " reason=already_in_foreground");
+        } else {
+            try {
+                foregroundPromoter.startForegroundService(this);
+                internalStartForeground();
+            } catch (RuntimeException e) {
+                final String fields = "serviceGeneration=" + serviceGeneration
+                        + " error=" + e.getClass().getSimpleName();
+                if (isForegroundServiceStartNotAllowed(e)) {
+                    foregroundFailure = ForegroundFailure.REFUSED;
+                    log("foreground_start_refused", fields);
+                    return e;
+                }
+                foregroundFailure = ForegroundFailure.FAILED;
+                log("foreground_start_failed", fields);
+                throw e;
             }
-            foregroundFailure = ForegroundFailure.FAILED;
-            log("foreground_start_failed", fields);
-            throw e;
         }
+        // Last, so that a failure to take the wake lock leaves the playing
+        // state unentered and the next attempt tries again (reusing the
+        // foreground service).
+        acquireWakeLock();
         playingStateEntered = true;
         foregroundFailure = ForegroundFailure.NONE;
-        acquireWakeLock();
-        return true;
+        return null;
     }
 
     private static boolean isForegroundServiceStartNotAllowed(RuntimeException e) {

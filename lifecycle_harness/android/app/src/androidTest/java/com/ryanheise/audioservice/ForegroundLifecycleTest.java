@@ -24,6 +24,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.os.SystemClock;
 import android.service.notification.StatusBarNotification;
+import android.support.v4.media.MediaBrowserCompat;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaControllerCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
@@ -50,6 +51,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -75,6 +77,7 @@ public class ForegroundLifecycleTest {
     private final Context context = ApplicationProvider.getApplicationContext();
     private final Handler main = new Handler(Looper.getMainLooper());
     private ActivityScenario<AudioServiceActivity> scenario;
+    private MediaBrowserCompat browser;
 
     @Before
     public void startWithoutEngineOrService() throws Exception {
@@ -88,6 +91,13 @@ public class ForegroundLifecycleTest {
     @After
     public void cleanUp() throws Exception {
         AudioService.foregroundPromoter = AudioService.FRAMEWORK_FOREGROUND_PROMOTER;
+        if (browser != null) {
+            runOnMain(() -> {
+                browser.disconnect();
+                return null;
+            });
+            browser = null;
+        }
         if (scenario != null) {
             scenario.close();
             scenario = null;
@@ -219,10 +229,9 @@ public class ForegroundLifecycleTest {
     }
 
     /**
-     * Android refuses the foreground start, here from startForeground() after
-     * startForegroundService() went through. Nothing may be left half established: no playing
-     * state, no wake lock, no foreground service. The media session stays active so media buttons
-     * still reach the handler, and Dart is told once.
+     * Android refuses the foreground start (simulated: see {@link ScriptedPromoter}). Nothing may be
+     * left half established: no playing state, no wake lock, no foreground service. The media
+     * session stays active so media buttons still reach the handler, and Dart is told once.
      */
     @Test
     public void refusedForegroundStartLeavesNothingHalfEstablished() throws Exception {
@@ -483,6 +492,86 @@ public class ForegroundLifecycleTest {
         assertEquals(Collections.singletonList(stop("REMOVE", second)), promoter.stops);
     }
 
+    /**
+     * A service destroyed while playing is recreated without an Activity (here by a MediaBrowser,
+     * as Android Auto or SystemUI would) and replays the playing state, and Android refuses its
+     * foreground start. No live update reaches this instance to report it, so the replay must:
+     * Dart gets FOREGROUND_START_REFUSED, and nothing is left half established.
+     */
+    @Test
+    public void refusedForegroundStartOnStateReplayIsReportedToDart() throws Exception {
+        assumeTrue("ForegroundServiceStartNotAllowedException needs API 31", Build.VERSION.SDK_INT >= 31);
+        final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.ALLOW);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        final AudioService first = AudioService.instance;
+        play(controller);
+        await("AudioService did not enter its playing foreground state",
+                () -> first.isInForeground() && isAudioServiceStartedInForeground(), TIMEOUT_MS);
+        closeActivity();
+        promoter.mode = ScriptedPromoter.Mode.REFUSE;
+        context.stopService(new Intent(context, AudioService.class));
+        await("AudioService was not destroyed", () -> AudioService.instance == null, TIMEOUT_MS);
+
+        // Inside the disposal delay, so the engine and its playing handler survive.
+        final CountDownLatch connected = new CountDownLatch(1);
+        runOnMain(() -> {
+            browser = new MediaBrowserCompat(context, new ComponentName(context, AudioService.class),
+                    new MediaBrowserCompat.ConnectionCallback() {
+                        @Override
+                        public void onConnected() {
+                            connected.countDown();
+                        }
+                    }, null);
+            browser.connect();
+            return null;
+        });
+        assertTrue("MediaBrowser did not connect", connected.await(TIMEOUT_MS, TimeUnit.MILLISECONDS));
+        final AudioService second = AudioService.instance;
+        assertNotNull("AudioService was not recreated", second);
+        assertTrue("The recreated service must replay the playing state", second.isPlaying());
+        final MediaControllerCompat secondController =
+                runOnMain(() -> new MediaControllerCompat(context, second.getSessionToken()));
+        await("The refused replay was not reported to Dart", () -> asyncErrorCount(secondController) == 1,
+                TIMEOUT_MS);
+        assertEquals(AudioService.FOREGROUND_START_REFUSED, lastAsyncError(secondController));
+        assertEquals("The replay must make one attempt", 2, promoter.attempts.get());
+        assertFalse("A refused start must not leave the playing state entered", second.isPlayingStateEntered());
+        assertFalse("A refused start must not leave the wake lock held", second.isWakeLockHeld());
+        assertFalse(isAudioServiceStartedInForeground());
+        assertHoldsFor("The refusal must be reported to Dart once",
+                () -> asyncErrorCount(secondController) == 1, 1_000);
+    }
+
+    /**
+     * With androidStopForegroundOnPause false, a pause leaves the service in the foreground. The
+     * next play must reuse that foreground service rather than promote the service again, which
+     * would only give Android a chance to refuse (or fail) a start it does not need.
+     */
+    @Test
+    public void playAfterPauseKeepingForegroundReusesIt() throws Exception {
+        final ScriptedPromoter promoter = installPromoter(ScriptedPromoter.Mode.ALLOW);
+        final MediaControllerCompat controller = launchAndAwaitHandler();
+        final AudioService service = AudioService.instance;
+        // In memory only: a recreated service reads the configuration Dart saved.
+        service.getConfig().androidStopForegroundOnPause = false;
+        play(controller);
+        await("AudioService did not enter its playing foreground state",
+                () -> service.isPlayingStateEntered() && isAudioServiceStartedInForeground(), TIMEOUT_MS);
+        pause(controller);
+        assertFalse(service.isPlayingStateEntered());
+        assertTrue("The pause must keep the foreground service", service.isInForeground());
+
+        // Any further promotion would now fail.
+        promoter.mode = ScriptedPromoter.Mode.FAIL;
+        play(controller);
+        await("The play did not re-enter the playing state", service::isPlayingStateEntered, TIMEOUT_MS);
+        assertEquals("The service must not be promoted again", 1, promoter.attempts.get());
+        assertTrue(service.isWakeLockHeld());
+        assertTrue(isAudioServiceStartedInForeground());
+        assertEquals(Collections.emptyList(), promoter.stops);
+        assertHoldsFor("Nothing may be reported to Dart", () -> asyncErrorCount(controller) == 0, 1_000);
+    }
+
     private static ScriptedPromoter installPromoter(ScriptedPromoter.Mode mode) {
         final ScriptedPromoter promoter = new ScriptedPromoter(mode);
         AudioService.foregroundPromoter = promoter;
@@ -550,8 +639,14 @@ public class ForegroundLifecycleTest {
     /**
      * Stands in for the framework's foreground calls. REFUSE throws what Android 12+ throws for a
      * start from the background; FAIL throws a plain IllegalStateException, as Android 14+ does for
-     * a missing or invalid foreground service type. Neither makes a framework call, so no pending
-     * startForegroundService() is left behind; ALLOW makes the real calls.
+     * a missing or invalid foreground service type. Neither makes a framework call; ALLOW makes the
+     * real calls.
+     *
+     * <p>A real refusal cannot be reproduced here (the instrumented process counts as foreground)
+     * nor faithfully simulated: making the real startForegroundService() and then throwing instead
+     * of calling startForeground() would leave Android waiting for startForeground(), which a real
+     * refusal does not (Android clears that wait inside startForeground() before refusing). Real
+     * refusals, in either phase, are covered by ReliefMix's host runner on API 32 and 36.</p>
      */
     private static final class ScriptedPromoter implements AudioService.ForegroundPromoter {
         enum Mode { ALLOW, REFUSE, FAIL }
