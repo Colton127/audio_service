@@ -179,6 +179,10 @@ abstract class AudioHandlerCallbacks {
   /// Handle the notification being clicked (Android).
   Future<void> onNotificationClicked(OnNotificationClickedRequest request);
 
+  /// Handle an error that the platform caught instead of letting it crash the
+  /// app (Android). Does nothing by default.
+  Future<void> onPlatformError(OnPlatformErrorRequest request) async {}
+
   /// Get the children of a parent media item.
   Future<GetChildrenResponse> getChildren(GetChildrenRequest request);
 
@@ -1198,6 +1202,34 @@ class OnNotificationDeletedRequest {
   const OnNotificationDeletedRequest();
 
   Map<String, dynamic> toMap() => <String, dynamic>{};
+}
+
+class OnPlatformErrorRequest {
+  /// The platform method that caught the error, e.g.
+  /// `AudioService.onStartCommand`.
+  final String where;
+
+  /// The platform type of the error, e.g. a Java exception class name.
+  final String type;
+
+  final String? message;
+
+  final String stackTrace;
+
+  @literal
+  const OnPlatformErrorRequest({
+    required this.where,
+    required this.type,
+    this.message,
+    required this.stackTrace,
+  });
+
+  Map<String, dynamic> toMap() => <String, dynamic>{
+        'where': where,
+        'type': type,
+        'message': message,
+        'stackTrace': stackTrace,
+      };
 }
 
 class GetChildrenRequest {

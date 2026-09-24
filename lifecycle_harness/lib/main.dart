@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 /// Minimal app for the AudioService lifecycle instrumentation tests.
@@ -13,10 +14,13 @@ import 'package:flutter/widgets.dart';
 /// artwork) and a queue so that ServiceRecreationTest can check that state is
 /// replayed into a recreated AudioService. Its play() and pause() only publish
 /// a playing or paused state, which puts AudioService in (or takes it out of)
-/// its playing foreground state as real playback would.
+/// its playing foreground state as real playback would, and seek() publishes
+/// a new position (also as the buffered position) without leaving that state. Errors reaching
+/// AudioService.asyncError are counted in the media item's extras, where the
+/// instrumentation tests read them through a MediaController.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await AudioService.init(
+  final handler = await AudioService.init(
     builder: () => _HarnessAudioHandler(),
     config: const AudioServiceConfig(
       androidNotificationChannelId:
@@ -24,16 +28,19 @@ Future<void> main() async {
       androidNotificationChannelName: 'Audio playback',
     ),
   );
+  AudioService.asyncError.listen(handler.reportAsyncError);
   runApp(const Directionality(
     textDirection: TextDirection.ltr,
     child: Center(child: Text('AudioService lifecycle harness')),
   ));
 }
 
-/// A valid 1x1 PNG. A file:// artUri is sent to the platform as its cache
-/// file path, so artwork loads without network access.
+/// A valid 64x64 PNG. A file:// artUri is sent to the platform as its cache
+/// file path, so artwork loads without network access. Android 8.0 cannot lay
+/// out a media notification with 1x1 artwork ("Couldn't inflate contentViews"),
+/// which kills the app.
 const _artworkPng =
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR42u3PQQkAAAgEsItjJtMZ1Qi+hcEKLNXzWgQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQELgtQSiEPtYVDTgAAAABJRU5ErkJggg==';
 
 class _HarnessAudioHandler extends BaseAudioHandler {
   _HarnessAudioHandler() {
@@ -51,6 +58,52 @@ class _HarnessAudioHandler extends BaseAudioHandler {
   @override
   Future<void> pause() async {
     playbackState.add(playbackState.value.copyWith(playing: false));
+  }
+
+  /// Also publishes [position] as the buffered position: Android extrapolates
+  /// the position of a playing state for its controllers, but not the
+  /// buffered position, so tests wait for that to know a seek was applied.
+  @override
+  Future<void> seek(Duration position) async {
+    playbackState.add(playbackState.value
+        .copyWith(updatePosition: position, bufferedPosition: position));
+  }
+
+  /// The children of [slowParentMediaId] are answered after five seconds, so
+  /// that a test can destroy AudioService while the request is pending.
+  static const slowParentMediaId = 'slow';
+
+  /// Asking for the children of [failingParentMediaId] throws.
+  static const failingParentMediaId = 'failing';
+
+  @override
+  Future<List<MediaItem>> getChildren(String parentMediaId,
+      [Map<String, dynamic>? options]) async {
+    switch (parentMediaId) {
+      case slowParentMediaId:
+        await Future<void>.delayed(const Duration(seconds: 5));
+        return queue.value;
+      case failingParentMediaId:
+        throw StateError('simulated getChildren failure');
+      default:
+        return [];
+    }
+  }
+
+  var _asyncErrorCount = 0;
+
+  void reportAsyncError(Object error) {
+    // A failed media item update is reported with this code; counting it
+    // would send another media item update, which could fail the same way.
+    if (error is PlatformException && error.code == 'UNEXPECTED_ERROR') return;
+    final item = mediaItem.value;
+    if (item == null) return;
+    _asyncErrorCount++;
+    mediaItem.add(item.copyWith(extras: {
+      ...?item.extras,
+      'asyncErrorCount': _asyncErrorCount,
+      'lastAsyncError': error is PlatformException ? error.code : '$error',
+    }));
   }
 
   Future<void> _publish() async {

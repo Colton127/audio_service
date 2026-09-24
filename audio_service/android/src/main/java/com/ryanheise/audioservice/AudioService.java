@@ -1,5 +1,6 @@
 package com.ryanheise.audioservice;
 
+import android.app.ForegroundServiceStartNotAllowedException;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -62,7 +63,7 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     private static final String SHARED_PREFERENCES_NAME = "audio_service_preferences";
 
-    private static final int NOTIFICATION_ID = 1124;
+    static final int NOTIFICATION_ID = 1124;
     private static final int REQUEST_CONTENT_INTENT = 1000;
     public static final String NOTIFICATION_CLICK_ACTION = "com.ryanheise.audioservice.NOTIFICATION_CLICK";
     public static final String CUSTOM_ACTION_STOP = "com.ryanheise.audioservice.action.STOP";
@@ -111,6 +112,40 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     public static void init(ServiceListener listener) {
         AudioService.listener = listener;
+    }
+
+    private interface ListenerCall {
+        void call(ServiceListener listener);
+    }
+
+    /**
+     * Calls into the plugin's listener, if one is registered. These calls run
+     * from framework callbacks (media session commands, service lifecycle),
+     * where an exception would crash the app, so it is reported instead.
+     */
+    private static void callListener(String where, ListenerCall call) {
+        final ServiceListener listener = AudioService.listener;
+        if (listener == null) return;
+        try {
+            call.call(listener);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report(where, e);
+        }
+    }
+
+    /**
+     * Answers a browse request (children, item or search) whose handling
+     * failed, unless it was already answered. It is answered with null, which
+     * MediaBrowser clients receive as an error: Result.sendError() throws
+     * UnsupportedOperationException for these requests, it is only supported
+     * for custom actions.
+     */
+    static void failIfUnanswered(Result<?> result) {
+        try {
+            result.sendResult(null);
+        } catch (IllegalStateException alreadyAnswered) {
+            // Nothing left to answer.
+        }
     }
 
     public static int toKeyCode(long action) {
@@ -282,16 +317,43 @@ public class AudioService extends MediaBrowserServiceCompat {
     private LruCache<String, Bitmap> artBitmapCache;
     private boolean playing = false;
     /**
-     * Whether enterPlayingState() has run (and exitPlayingState() has not)
-     * on this instance. Distinct from {@link #playing}: a replayed state can
-     * report playing without the foreground service, notification and wake
-     * lock having been established on this instance yet.
+     * Whether this instance is in the playing state: started in the
+     * foreground with its notification, holding the wake lock. Set only once
+     * startForeground() has succeeded, and cleared by exitPlayingState().
+     * Distinct from {@link #playing}, which is what the handler reports: a
+     * replayed state or a refused start leaves playing without it.
      */
     private boolean playingStateEntered = false;
+    /**
+     * Why entering the playing state last failed while the handler kept
+     * playing. Live state updates do not retry a failure, since a playing
+     * handler can send several per second; a new play does, and a REFUSED
+     * start is also retried where Android is likely to allow it again (see
+     * retryForegroundIfPlaying).
+     */
+    private ForegroundFailure foregroundFailure = ForegroundFailure.NONE;
+    /** A refusal from a live state update that has not been reported to Dart yet. */
+    private boolean foregroundRefusalUnreported;
     private AudioProcessingState processingState = AudioProcessingState.idle;
     private int repeatMode;
     private int shuffleMode;
     private boolean notificationCreated;
+    /**
+     * Whether this instance is a foreground service: set once startForeground()
+     * has succeeded, cleared when it leaves the foreground. stopForeground() is
+     * a blocking call into system_server, which ignores it for a service that
+     * is not in the foreground, so it is only made when there is a foreground
+     * state to leave. Distinct from {@link #notificationCreated}: leaving the
+     * foreground with STOP_FOREGROUND_LEGACY keeps the notification.
+     */
+    private boolean inForeground;
+    /**
+     * Whether this instance asked Android to start it (startForegroundService())
+     * and has not stopped itself since: Android then keeps it alive with no
+     * binding left. Tracked so that a refused promotion undoes only a start that
+     * the same attempt made.
+     */
+    private boolean startRequested;
     /** Process-local counter of AudioService instances. Diagnostic only. */
     private static int serviceGenerationCounter;
     private final int serviceGeneration = ++serviceGenerationCounter;
@@ -311,6 +373,26 @@ public class AudioService extends MediaBrowserServiceCompat {
         return serviceGeneration;
     }
 
+    /** Diagnostic only: whether this instance is in the playing state. */
+    boolean isPlayingStateEntered() {
+        return playingStateEntered;
+    }
+
+    /** Diagnostic only: whether this instance holds its partial wake lock. */
+    boolean isWakeLockHeld() {
+        return wakeLock.isHeld();
+    }
+
+    /** Diagnostic only: whether this instance is a foreground service. */
+    boolean isInForeground() {
+        return inForeground;
+    }
+
+    /** Diagnostic only: whether this instance's media session is active. */
+    boolean isMediaSessionActive() {
+        return mediaSession != null && mediaSession.isActive();
+    }
+
     public int getRepeatMode() {
         return repeatMode;
     }
@@ -327,6 +409,8 @@ public class AudioService extends MediaBrowserServiceCompat {
         repeatMode = 0;
         shuffleMode = 0;
         notificationCreated = false;
+        inForeground = false;
+        startRequested = false;
         playing = false;
         processingState = AudioProcessingState.idle;
         mediaSession = new MediaSessionCompat(this, "media-session");
@@ -363,12 +447,10 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         log("service_engine_request", "serviceGeneration=" + serviceGeneration);
         flutterEngine = AudioServicePlugin.getFlutterEngine(this);
-        if (listener != null) {
-            // If this instance replaces a destroyed one while the engine (and
-            // the Dart AudioHandler) survived, the listener projects the
-            // current state into this fresh MediaSession.
-            listener.onCreate();
-        }
+        // If this instance replaces a destroyed one while the engine (and the
+        // Dart AudioHandler) survived, the listener projects the current state
+        // into this fresh MediaSession.
+        callListener("AudioService.onCreate", ServiceListener::onCreate);
         log("service_create_end", "serviceGeneration=" + serviceGeneration
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
                 + " engineHash=" + hashOf(flutterEngine));
@@ -379,7 +461,11 @@ public class AudioService extends MediaBrowserServiceCompat {
         log("service_start_command", "serviceGeneration=" + serviceGeneration
                 + " startId=" + startId + " flags=" + flags
                 + " action=" + (intent != null ? intent.getAction() : "none"));
-        MediaButtonReceiver.handleIntent(mediaSession, intent);
+        try {
+            MediaButtonReceiver.handleIntent(mediaSession, intent);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onStartCommand", e);
+        }
         return START_NOT_STICKY;
     }
 
@@ -403,6 +489,7 @@ public class AudioService extends MediaBrowserServiceCompat {
     public void stop() {
         log("service_stop_requested", "serviceGeneration=" + serviceGeneration);
         deactivateMediaSession();
+        startRequested = false;
         stopSelf();
     }
 
@@ -410,16 +497,15 @@ public class AudioService extends MediaBrowserServiceCompat {
     public void onDestroy() {
         log("service_destroy_begin", "serviceGeneration=" + serviceGeneration
                 + " engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration()
-                + " engineHash=" + hashOf(flutterEngine));
+                + " engineHash=" + hashOf(flutterEngine)
+                + " inForeground=" + inForeground);
         super.onDestroy();
-        if (listener != null) {
-            // The listener (the plugin's AudioHandlerInterface) belongs to the
-            // shared FlutterEngine, which outlives this service instance. It
-            // stays registered so that a recreated service keeps dispatching to
-            // the same AudioHandler; the plugin clears it when the engine that
-            // hosts it is detached.
-            listener.onDestroy();
-        }
+        // The listener (the plugin's AudioHandlerInterface) belongs to the
+        // shared FlutterEngine, which outlives this service instance. It stays
+        // registered so that a recreated service keeps dispatching to the same
+        // AudioHandler; the plugin clears it when the engine that hosts it is
+        // detached. A failure there must not skip the cleanup below.
+        callListener("AudioService.onDestroy", ServiceListener::onDestroy);
         mediaMetadata = null;
         artBitmap = null;
         queue.clear();
@@ -427,37 +513,46 @@ public class AudioService extends MediaBrowserServiceCompat {
         controls.clear();
         artBitmapCache.evictAll();
         compactActionIndices = null;
-        releaseMediaSession();
-        legacyStopForeground(!config.androidResumeOnClick, "service_destroy");
-        // This still does not solve the Android 11 problem.
-        // if (notificationCreated) {
-        //     NotificationManager notificationManager = getNotificationManager();
-        //     notificationManager.cancel(NOTIFICATION_ID);
-        // }
+        // releaseMediaSession() also cancels the notification. There is no
+        // stopForeground() here: before calling onDestroy() the system has
+        // already taken this service out of the foreground and cancelled a
+        // notification still attached to it (ActiveServices.
+        // bringDownServiceLocked), so the call would only be a blocking round
+        // trip into system_server (RELIEFMIX-3R5).
+        // A failure here must not skip the rest: a stale instance would make
+        // the scheduled engine disposal take this service for a recreated one
+        // and keep the engine, and the wake lock must not outlive the service.
+        try {
+            releaseMediaSession();
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onDestroy", e);
+        }
+        inForeground = false;
+        startRequested = false;
         releaseWakeLock();
         instance = null;
         notificationCreated = false;
         log("service_destroy_end", "serviceGeneration=" + serviceGeneration);
     }
 
+    /**
+     * Leaves the foreground, removing the notification or keeping it attached
+     * to the service (STOP_FOREGROUND_LEGACY: the system still removes it when
+     * the service is destroyed, unlike STOP_FOREGROUND_DETACH). Skipped if the
+     * service is not in the foreground, e.g. already left on pause.
+     */
     private void legacyStopForeground(boolean removeNotification, String reason) {
         final String fields = "serviceGeneration=" + serviceGeneration
                 + " reason=" + reason + " removeNotification=" + removeNotification;
-        log("foreground_stop_requested", fields);
-        legacyStopForeground(removeNotification);
-        log("foreground_stopped", fields);
-    }
-
-    @SuppressWarnings("deprecation")
-    private void legacyStopForeground(boolean removeNotification) {
-        if (Build.VERSION.SDK_INT >= 24) {
-            // TODO: Consider application of STOP_FOREGROUND_DETACH
-            stopForeground(removeNotification ? STOP_FOREGROUND_REMOVE : 0);
-        } else {
-            // TODO: This API is deprecated and we'll need to eventually
-            // delete this line.
-            stopForeground(removeNotification);
+        if (!inForeground) {
+            log("foreground_stop_skipped", fields);
+            return;
         }
+        log("foreground_stop_requested", fields);
+        inForeground = false;
+        foregroundPromoter.stopForeground(this,
+                removeNotification ? STOP_FOREGROUND_REMOVE : STOP_FOREGROUND_LEGACY);
+        log("foreground_stopped", fields);
     }
 
     public AudioServiceConfig getConfig() {
@@ -610,6 +705,7 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
         this.compactActionIndices = compactActionIndices;
         AudioProcessingState oldProcessingState = this.processingState;
+        final boolean wasPlaying = this.playing;
         this.processingState = processingState;
         this.playing = playing;
         this.repeatMode = repeatMode;
@@ -645,22 +741,32 @@ public class AudioService extends MediaBrowserServiceCompat {
         mediaSession.setCaptioningEnabled(captioningEnabled);
 
         if (replay) {
-            // Restoring, not transitioning. The session is activated so that
-            // a playing session is routed media buttons as before, but the
-            // foreground service, notification and wake lock are established
-            // by the next live update through enterPlayingState() (see
-            // playingStateEntered), and the idle/completed transitions are
-            // not re-run: the old instance already ran them.
+            // Restoring, not transitioning: the idle/completed transitions
+            // are not re-run, the old instance already ran them. A playing
+            // handler does get its foreground service, notification and wake
+            // lock back now, since a handler that keeps playing sends no
+            // further live update that would establish them.
             if (playing) {
                 activateMediaSession();
+                retryForegroundIfPlaying(REASON_STATE_REPLAY);
             }
             return;
         }
 
-        if (playing && !playingStateEntered) {
-            enterPlayingState();
-        } else if (!playing && playingStateEntered) {
-            exitPlayingState();
+        if (playing) {
+            // Once an attempt has failed, only a new play retries it here:
+            // repeating it on every update of a handler that keeps playing
+            // would not change Android's answer.
+            if (!playingStateEntered
+                    && (!wasPlaying || foregroundFailure == ForegroundFailure.NONE)
+                    && enterPlayingState() != null) {
+                foregroundRefusalUnreported = true;
+            }
+        } else {
+            foregroundFailure = ForegroundFailure.NONE;
+            if (playingStateEntered) {
+                exitPlayingState();
+            }
         }
 
 
@@ -692,13 +798,11 @@ public class AudioService extends MediaBrowserServiceCompat {
                 volumeProvider = new VolumeProviderCompat(volumeControlType, maxVolume, volume) {
                     @Override
                     public void onSetVolumeTo(int volumeIndex) {
-                        if (listener == null) return;
-                        listener.onSetVolumeTo(volumeIndex);
+                        callListener("VolumeProvider.onSetVolumeTo", l -> l.onSetVolumeTo(volumeIndex));
                     }
                     @Override
                     public void onAdjustVolume(int direction) {
-                        if (listener == null) return;
-                        listener.onAdjustVolume(direction);
+                        callListener("VolumeProvider.onAdjustVolume", l -> l.onAdjustVolume(direction));
                     }
                 };
             } else {
@@ -790,8 +894,7 @@ public class AudioService extends MediaBrowserServiceCompat {
     }
 
     public void handleDeleteNotification() {
-        if (listener == null) return;
-        listener.onClose();
+        callListener("AudioService.handleDeleteNotification", ServiceListener::onClose);
     }
 
 
@@ -814,16 +917,179 @@ public class AudioService extends MediaBrowserServiceCompat {
         }
     }
 
-    private void enterPlayingState() {
-        playingStateEntered = true;
-        ContextCompat.startForegroundService(this, new Intent(AudioService.this, AudioService.class));
-        if (!mediaSession.isActive())
-            mediaSession.setActive(true);
-
-        acquireWakeLock();
-        mediaSession.setSessionActivity(contentIntent);
-        internalStartForeground();
+    /**
+     * Whether the last live state update was refused a foreground-service
+     * start. Answers true once per refusal, so that it is reported to Dart
+     * once per play rather than on every update.
+     */
+    boolean consumeForegroundStartRefusal() {
+        final boolean refused = foregroundRefusalUnreported;
+        foregroundRefusalUnreported = false;
+        return refused;
     }
+
+    /**
+     * Enters the playing state if the handler reports playing but this
+     * instance has not established it, at a point where Android is likely to
+     * allow the foreground-service start (an Activity resumed, a state
+     * replay). A refusal is logged and left for the next such point; a refused
+     * replay is also reported to Dart as FOREGROUND_START_REFUSED, since this
+     * instance's playing state reached Dart through no live update that could
+     * report it. Any other failure is reported (see AudioServiceErrors) and not
+     * retried here until playback restarts. Never throws: it runs from
+     * lifecycle callbacks, where an exception would crash the app.
+     */
+    void retryForegroundIfPlaying(String reason) {
+        if (!playing || playingStateEntered || foregroundFailure == ForegroundFailure.FAILED) return;
+        log("foreground_retry", "serviceGeneration=" + serviceGeneration + " reason=" + reason);
+        try {
+            final RuntimeException refusal = enterPlayingState();
+            if (refusal != null && REASON_STATE_REPLAY.equals(reason)) {
+                AudioServiceErrors.report(FOREGROUND_START_REFUSED, refusal);
+            }
+        } catch (ForegroundStartFailedException e) {
+            // enterPlayingState() recorded it as FAILED, so it is not retried
+            // here again; a new play attempts it again from a live update.
+            AudioServiceErrors.report(FOREGROUND_START_FAILED, e.getCause());
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.retryForegroundIfPlaying", e);
+        }
+    }
+
+    /** The error code with which a refused foreground start reaches Dart. */
+    static final String FOREGROUND_START_REFUSED = "FOREGROUND_START_REFUSED";
+    /**
+     * The error code with which any other foreground start failure reaches
+     * Dart. Unlike a refusal it is not expected to go away by itself.
+     */
+    static final String FOREGROUND_START_FAILED = "FOREGROUND_START_FAILED";
+
+    /** A foreground start failed for a reason other than a refusal; see {@link #getCause()}. */
+    static final class ForegroundStartFailedException extends RuntimeException {
+        ForegroundStartFailedException(RuntimeException cause) {
+            super(cause.getClass().getName() + ": " + cause.getMessage(), cause);
+        }
+    }
+    private static final String REASON_STATE_REPLAY = "state_replay";
+
+    /**
+     * Starts the service in the foreground and only then takes the wake lock
+     * and marks the playing state entered, so a failure leaves nothing half
+     * established. A service still in the foreground, as a pause leaves it
+     * when androidStopForegroundOnPause is false, is not promoted again: that
+     * would only give Android a chance to refuse a foreground service this
+     * instance already has. Returns the refusal if Android refused the start
+     * from the background (Android 12+), which is retryable, and null on
+     * success. Any other failure, such as a missing or invalid foreground
+     * service type, propagates as a {@link ForegroundStartFailedException}. A
+     * start that this attempt made is undone on failure.
+     */
+    private RuntimeException enterPlayingState() {
+        // Neither is a held resource. The session stays active while playing
+        // even if the start is refused, so that media buttons keep reaching
+        // the handler; buildNotification() reads the session activity.
+        activateMediaSession();
+        mediaSession.setSessionActivity(contentIntent);
+        if (inForeground) {
+            log("foreground_start_skipped", "serviceGeneration=" + serviceGeneration
+                    + " reason=already_in_foreground");
+        } else {
+            final boolean wasStartRequested = startRequested;
+            boolean startedNow = false;
+            try {
+                foregroundPromoter.startForegroundService(this);
+                startedNow = !wasStartRequested;
+                startRequested = true;
+                internalStartForeground();
+            } catch (RuntimeException e) {
+                final String fields = "serviceGeneration=" + serviceGeneration
+                        + " error=" + e.getClass().getSimpleName();
+                if (startedNow) {
+                    // Android 12L refuses startForeground() after
+                    // startForegroundService() went through, which left this
+                    // service started: it would outlive its bindings, playing
+                    // without a foreground service until Android stops it.
+                    // Undo that start, so that it lives as long as a refusal
+                    // of the first call would leave it (its bindings).
+                    startRequested = false;
+                    stopSelf();
+                    log("service_start_rolled_back", fields);
+                }
+                if (isForegroundServiceStartNotAllowed(e)) {
+                    foregroundFailure = ForegroundFailure.REFUSED;
+                    log("foreground_start_refused", fields);
+                    return e;
+                }
+                foregroundFailure = ForegroundFailure.FAILED;
+                log("foreground_start_failed", fields);
+                throw new ForegroundStartFailedException(e);
+            }
+        }
+        // Last, so that a failure to take the wake lock leaves the playing
+        // state unentered and the next attempt tries again (reusing the
+        // foreground service).
+        acquireWakeLock();
+        playingStateEntered = true;
+        foregroundFailure = ForegroundFailure.NONE;
+        return null;
+    }
+
+    private static boolean isForegroundServiceStartNotAllowed(RuntimeException e) {
+        return Build.VERSION.SDK_INT >= 31 && Api31.isForegroundServiceStartNotAllowed(e);
+    }
+
+    @RequiresApi(31)
+    private static final class Api31 {
+        static boolean isForegroundServiceStartNotAllowed(RuntimeException e) {
+            return e instanceof ForegroundServiceStartNotAllowedException;
+        }
+    }
+
+    private enum ForegroundFailure {
+        NONE,
+        /** Android refused a start from the background; retryable. */
+        REFUSED,
+        /** Any other failure; it is not expected to succeed on a retry. */
+        FAILED
+    }
+
+    /**
+     * The framework calls that put the service in the foreground and take it
+     * out. Tests replace {@link #foregroundPromoter} to make them fail as
+     * Android would, or to observe them.
+     */
+    interface ForegroundPromoter {
+        void startForegroundService(AudioService service);
+
+        void startForeground(AudioService service, int id, Notification notification);
+
+        /** @param flags STOP_FOREGROUND_REMOVE or STOP_FOREGROUND_LEGACY */
+        void stopForeground(AudioService service, int flags);
+    }
+
+    static final ForegroundPromoter FRAMEWORK_FOREGROUND_PROMOTER = new ForegroundPromoter() {
+        @Override
+        public void startForegroundService(AudioService service) {
+            ContextCompat.startForegroundService(service, new Intent(service, AudioService.class));
+        }
+
+        @Override
+        public void startForeground(AudioService service, int id, Notification notification) {
+            service.startForeground(id, notification);
+        }
+
+        @Override
+        @SuppressWarnings("deprecation")
+        public void stopForeground(AudioService service, int flags) {
+            if (Build.VERSION.SDK_INT >= 24) {
+                service.stopForeground(flags);
+            } else {
+                service.stopForeground((flags & STOP_FOREGROUND_REMOVE) != 0);
+            }
+        }
+    };
+
+    static volatile ForegroundPromoter foregroundPromoter = FRAMEWORK_FOREGROUND_PROMOTER;
 
     private void exitPlayingState() {
         playingStateEntered = false;
@@ -841,8 +1107,9 @@ public class AudioService extends MediaBrowserServiceCompat {
         final String fields = "serviceGeneration=" + serviceGeneration
                 + " reason=enter_playing_state";
         log("foreground_start_requested", fields);
-        startForeground(NOTIFICATION_ID, buildNotification());
+        foregroundPromoter.startForeground(this, NOTIFICATION_ID, buildNotification());
         log("foreground_started", fields);
+        inForeground = true;
         notificationCreated = true;
     }
 
@@ -921,7 +1188,14 @@ public class AudioService extends MediaBrowserServiceCompat {
         this.mediaMetadata = mediaMetadata;
         mediaSession.setMetadata(mediaMetadata);
         handler.removeCallbacksAndMessages(null);
-        handler.post(this::updateNotification);
+        handler.post(() -> {
+            // Posted, so nothing up the stack would catch a failure.
+            try {
+                updateNotification();
+            } catch (RuntimeException e) {
+                AudioServiceErrors.report("AudioService.updateNotification", e);
+            }
+        });
     }
 
     private MediaMetadataCompat putArtToMetadata(MediaMetadataCompat mediaMetadata) {
@@ -953,121 +1227,148 @@ public class AudioService extends MediaBrowserServiceCompat {
 
     @Override
     public void onLoadChildren(final String parentMediaId, final Result<List<MediaBrowserCompat.MediaItem>> result, Bundle options) {
+        final ServiceListener listener = AudioService.listener;
         if (listener == null) {
             result.sendResult(new ArrayList<>());
             return;
         }
-        listener.onLoadChildren(parentMediaId, result, options);
+        try {
+            listener.onLoadChildren(parentMediaId, result, options);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onLoadChildren", e);
+            failIfUnanswered(result);
+        }
     }
 
     @Override
     public void onLoadItem(String itemId, Result<MediaBrowserCompat.MediaItem> result) {
+        final ServiceListener listener = AudioService.listener;
         if (listener == null) {
             result.sendResult(null);
             return;
         }
-        listener.onLoadItem(itemId, result);
+        try {
+            listener.onLoadItem(itemId, result);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onLoadItem", e);
+            failIfUnanswered(result);
+        }
     }
 
     @Override
     public void onSearch(String query, Bundle extras, Result<List<MediaBrowserCompat.MediaItem>> result) {
+        final ServiceListener listener = AudioService.listener;
         if (listener == null) {
             result.sendResult(new ArrayList<>());
             return;
         }
-        listener.onSearch(query, extras, result);
+        try {
+            listener.onSearch(query, extras, result);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("AudioService.onSearch", e);
+            failIfUnanswered(result);
+        }
     }
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         log("service_task_removed", "serviceGeneration=" + serviceGeneration);
-        if (listener != null) {
-            listener.onTaskRemoved();
-        }
+        callListener("AudioService.onTaskRemoved", ServiceListener::onTaskRemoved);
         super.onTaskRemoved(rootIntent);
     }
 
+    /**
+     * Called by the framework for commands from any media controller
+     * (notification, lock screen, Bluetooth, Android Auto, other apps), so every
+     * call into the listener goes through callListener().
+     */
     public class MediaSessionCallback extends MediaSessionCompat.Callback {
         @Override
         public void onAddQueueItem(MediaDescriptionCompat description) {
-            if (listener == null) return;
-            listener.onAddQueueItem(getMediaMetadata(description.getMediaId()));
+            callListener("MediaSessionCallback.onAddQueueItem",
+                    l -> l.onAddQueueItem(getMediaMetadata(description.getMediaId())));
         }
 
         @Override
         public void onAddQueueItem(MediaDescriptionCompat description, int index) {
-            if (listener == null) return;
-            listener.onAddQueueItemAt(getMediaMetadata(description.getMediaId()), index);
+            callListener("MediaSessionCallback.onAddQueueItem",
+                    l -> l.onAddQueueItemAt(getMediaMetadata(description.getMediaId()), index));
         }
 
         @Override
         public void onRemoveQueueItem(MediaDescriptionCompat description) {
-            if (listener == null) return;
-            listener.onRemoveQueueItem(getMediaMetadata(description.getMediaId()));
+            callListener("MediaSessionCallback.onRemoveQueueItem",
+                    l -> l.onRemoveQueueItem(getMediaMetadata(description.getMediaId())));
         }
 
         @Override
         public void onPrepare() {
-            if (listener == null) return;
-            if (!mediaSession.isActive())
-                mediaSession.setActive(true);
-            listener.onPrepare();
+            callListener("MediaSessionCallback.onPrepare", l -> {
+                activateMediaSession();
+                l.onPrepare();
+            });
         }
 
         @Override
         public void onPrepareFromMediaId(String mediaId, Bundle extras) {
-            if (listener == null) return;
-            if (!mediaSession.isActive())
-                mediaSession.setActive(true);
-            listener.onPrepareFromMediaId(mediaId, extras);
+            callListener("MediaSessionCallback.onPrepareFromMediaId", l -> {
+                activateMediaSession();
+                l.onPrepareFromMediaId(mediaId, extras);
+            });
         }
 
         @Override
         public void onPrepareFromSearch(String query, Bundle extras) {
-            if (listener == null) return;
-            if (!mediaSession.isActive())
-                mediaSession.setActive(true);
-            listener.onPrepareFromSearch(query, extras);
+            callListener("MediaSessionCallback.onPrepareFromSearch", l -> {
+                activateMediaSession();
+                l.onPrepareFromSearch(query, extras);
+            });
         }
 
         @Override
         public void onPrepareFromUri(Uri uri, Bundle extras) {
-            if (listener == null) return;
-            if (!mediaSession.isActive())
-                mediaSession.setActive(true);
-            listener.onPrepareFromUri(uri, extras);
+            callListener("MediaSessionCallback.onPrepareFromUri", l -> {
+                activateMediaSession();
+                l.onPrepareFromUri(uri, extras);
+            });
         }
 
         @Override
         public void onPlay() {
-            if (listener == null) return;
-            listener.onPlay();
+            callListener("MediaSessionCallback.onPlay", ServiceListener::onPlay);
         }
 
         @Override
         public void onPlayFromMediaId(final String mediaId, final Bundle extras) {
-            if (listener == null) return;
-            listener.onPlayFromMediaId(mediaId, extras);
+            callListener("MediaSessionCallback.onPlayFromMediaId", l -> l.onPlayFromMediaId(mediaId, extras));
         }
 
         @Override
         public void onPlayFromSearch(final String query, final Bundle extras) {
-            if (listener == null) return;
-            listener.onPlayFromSearch(query, extras);
+            callListener("MediaSessionCallback.onPlayFromSearch", l -> l.onPlayFromSearch(query, extras));
         }
 
         @Override
         public void onPlayFromUri(final Uri uri, final Bundle extras) {
-            if (listener == null) return;
-            listener.onPlayFromUri(uri, extras);
+            callListener("MediaSessionCallback.onPlayFromUri", l -> l.onPlayFromUri(uri, extras));
         }
 
         @Override
         public boolean onMediaButtonEvent(Intent mediaButtonEvent) {
             if (listener == null) return false;
-            // TODO: use typesafe version once SDK 33 is released.
-            @SuppressWarnings("deprecation")
-            final KeyEvent event = (KeyEvent)mediaButtonEvent.getExtras().getParcelable(Intent.EXTRA_KEY_EVENT);
+            final KeyEvent event;
+            try {
+                final Bundle extras = mediaButtonEvent != null ? mediaButtonEvent.getExtras() : null;
+                // TODO: use typesafe version once SDK 33 is released.
+                @SuppressWarnings("deprecation")
+                final KeyEvent extra = extras != null ? (KeyEvent)extras.getParcelable(Intent.EXTRA_KEY_EVENT) : null;
+                event = extra;
+            } catch (RuntimeException e) {
+                // The intent can come from any app; its extras may not unparcel.
+                AudioServiceErrors.report("MediaSessionCallback.onMediaButtonEvent", e);
+                return true;
+            }
+            if (event == null) return false;
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                 switch (event.getKeyCode()) {
                 case KEYCODE_BYPASS_PLAY:
@@ -1100,7 +1401,7 @@ public class AudioService extends MediaBrowserServiceCompat {
                     // These are the "genuine" media button click events
                 case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
                 case KeyEvent.KEYCODE_HEADSETHOOK:
-                    listener.onClick(eventToButton(event));
+                    callListener("MediaSessionCallback.onMediaButtonEvent", l -> l.onClick(eventToButton(event)));
                     break;
                 }
             }
@@ -1123,100 +1424,87 @@ public class AudioService extends MediaBrowserServiceCompat {
 
         @Override
         public void onPause() {
-            if (listener == null) return;
-            listener.onPause();
+            callListener("MediaSessionCallback.onPause", ServiceListener::onPause);
         }
 
         @Override
         public void onStop() {
-            if (listener == null) return;
-            listener.onStop();
+            callListener("MediaSessionCallback.onStop", ServiceListener::onStop);
         }
 
         @Override
         public void onSkipToNext() {
-            if (listener == null) return;
-            listener.onSkipToNext();
+            callListener("MediaSessionCallback.onSkipToNext", ServiceListener::onSkipToNext);
         }
 
         @Override
         public void onSkipToPrevious() {
-            if (listener == null) return;
-            listener.onSkipToPrevious();
+            callListener("MediaSessionCallback.onSkipToPrevious", ServiceListener::onSkipToPrevious);
         }
 
         @Override
         public void onFastForward() {
-            if (listener == null) return;
-            listener.onFastForward();
+            callListener("MediaSessionCallback.onFastForward", ServiceListener::onFastForward);
         }
 
         @Override
         public void onRewind() {
-            if (listener == null) return;
-            listener.onRewind();
+            callListener("MediaSessionCallback.onRewind", ServiceListener::onRewind);
         }
 
         @Override
         public void onSkipToQueueItem(long id) {
-            if (listener == null) return;
-            listener.onSkipToQueueItem(id);
+            callListener("MediaSessionCallback.onSkipToQueueItem", l -> l.onSkipToQueueItem(id));
         }
 
         @Override
         public void onSeekTo(long pos) {
-            if (listener == null) return;
-            listener.onSeekTo(pos);
+            callListener("MediaSessionCallback.onSeekTo", l -> l.onSeekTo(pos));
         }
 
         @Override
         public void onSetRating(RatingCompat rating) {
-            if (listener == null) return;
-            listener.onSetRating(rating);
+            callListener("MediaSessionCallback.onSetRating", l -> l.onSetRating(rating));
         }
 
         @Override
         public void onSetPlaybackSpeed(float speed) {
-            if (listener == null) return;
-            listener.onSetPlaybackSpeed(speed);
+            callListener("MediaSessionCallback.onSetPlaybackSpeed", l -> l.onSetPlaybackSpeed(speed));
         }
 
         @Override
         public void onSetCaptioningEnabled(boolean enabled) {
-            if (listener == null) return;
-            listener.onSetCaptioningEnabled(enabled);
+            callListener("MediaSessionCallback.onSetCaptioningEnabled", l -> l.onSetCaptioningEnabled(enabled));
         }
 
         @Override
         public void onSetRepeatMode(int repeatMode) {
-            if (listener == null) return;
-            listener.onSetRepeatMode(repeatMode);
+            callListener("MediaSessionCallback.onSetRepeatMode", l -> l.onSetRepeatMode(repeatMode));
         }
 
         @Override
         public void onSetShuffleMode(int shuffleMode) {
-            if (listener == null) return;
-            listener.onSetShuffleMode(shuffleMode);
+            callListener("MediaSessionCallback.onSetShuffleMode", l -> l.onSetShuffleMode(shuffleMode));
         }
 
         @Override
         public void onCustomAction(String action, Bundle extras) {
-            if (listener == null) return;
-            if (CUSTOM_ACTION_STOP.equals(action)) {
-                listener.onStop();
-            } else if (CUSTOM_ACTION_FAST_FORWARD.equals(action)) {
-                listener.onFastForward();
-            } else if (CUSTOM_ACTION_REWIND.equals(action)) {
-                listener.onRewind();
-            } else {
-                listener.onCustomAction(action, extras);
-            }
+            callListener("MediaSessionCallback.onCustomAction", l -> {
+                if (CUSTOM_ACTION_STOP.equals(action)) {
+                    l.onStop();
+                } else if (CUSTOM_ACTION_FAST_FORWARD.equals(action)) {
+                    l.onFastForward();
+                } else if (CUSTOM_ACTION_REWIND.equals(action)) {
+                    l.onRewind();
+                } else {
+                    l.onCustomAction(action, extras);
+                }
+            });
         }
 
         @Override
         public void onSetRating(RatingCompat rating, Bundle extras) {
-            if (listener == null) return;
-            listener.onSetRating(rating, extras);
+            callListener("MediaSessionCallback.onSetRating", l -> l.onSetRating(rating, extras));
         }
 
         //
@@ -1224,8 +1512,8 @@ public class AudioService extends MediaBrowserServiceCompat {
         //
 
         public void onPlayMediaItem(final MediaDescriptionCompat description) {
-            if (listener == null) return;
-            listener.onPlayMediaItem(getMediaMetadata(description.getMediaId()));
+            callListener("MediaSessionCallback.onPlayMediaItem",
+                    l -> l.onPlayMediaItem(getMediaMetadata(description.getMediaId())));
         }
     }
 

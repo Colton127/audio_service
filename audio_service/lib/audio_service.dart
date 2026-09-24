@@ -974,6 +974,13 @@ class AudioService {
   static final _asyncError = PublishSubject<Object>();
 
   /// A stream that broadcasts any exceptions that occur asynchronously.
+  ///
+  /// On Android this includes errors the plugin caught instead of letting
+  /// them crash the app, for example in a media session callback. They are
+  /// [PlatformException]s whose [PlatformException.code] names the plugin
+  /// method that caught the error (such as `AudioService.onStartCommand`),
+  /// whose message is the platform exception's type and message, and whose
+  /// details hold its stack trace.
   static Stream<Object> get asyncError => _asyncError;
 
   static final _compatibilitySwitcher = SwitchAudioHandler();
@@ -3891,6 +3898,15 @@ class _HandlerCallbacks extends AudioHandlerCallbacks {
   Future<void> onNotificationClicked(
       OnNotificationClickedRequest request) async {
     AudioService._notificationClicked.add(request.clicked);
+  }
+
+  @override
+  Future<void> onPlatformError(OnPlatformErrorRequest request) async {
+    AudioService._asyncError.add(PlatformException(
+      code: request.where,
+      message: '${request.type}: ${request.message}',
+      details: request.stackTrace,
+    ));
   }
 
   @override

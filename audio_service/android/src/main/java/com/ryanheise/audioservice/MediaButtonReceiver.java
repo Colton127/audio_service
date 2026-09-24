@@ -8,12 +8,17 @@ public class MediaButtonReceiver extends androidx.media.session.MediaButtonRecei
 
     @Override
     public void onReceive(Context context, Intent intent) {
-        if (intent != null
-                && ACTION_NOTIFICATION_DELETE.equals(intent.getAction())
-                && AudioService.instance != null) {
-            AudioService.instance.handleDeleteNotification();
-            return;
+        // Exported, so any app can send it anything.
+        try {
+            if (intent != null
+                    && ACTION_NOTIFICATION_DELETE.equals(intent.getAction())
+                    && AudioService.instance != null) {
+                AudioService.instance.handleDeleteNotification();
+                return;
+            }
+            super.onReceive(context, intent);
+        } catch (RuntimeException e) {
+            AudioServiceErrors.report("MediaButtonReceiver.onReceive", e);
         }
-        super.onReceive(context, intent);
     }
 }

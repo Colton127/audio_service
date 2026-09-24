@@ -52,6 +52,61 @@ This test was written on the fix branch and moved here from `audio_service/examp
 | `earlyUnbindDuringServiceCreateDoesNotLoopEngines` | Binds `AudioService`, then releases the binding while `onCreate` is still booting the engine (the entry point of the ReliefMix#79 loop). Exactly one engine is created, and the generation is stable at 3 s, 6 s, and 10 s |
 | `recreatedServiceReusesEngineAndRestoresState` | A service recreated inside the window reuses the engine and handler, and gets back the title, artwork, queue, playback state, and playback info. The replay causes no stop or disposal. Releasing the last binding then disposes the engine |
 
+### `ForegroundLifecycleTest`
+
+Checks that a playing handler ends up with a started, foreground `AudioService`, and that handler
+commands reach Dart. The instrumented process counts as foreground, so Android never refuses a
+foreground-service start here. Most tests replace `AudioService.foregroundPromoter`, the seam
+around `startForegroundService()`, `startForeground()` and `stopForeground()`, to simulate refused
+and failed starts or to record calls. A simulated refusal makes no framework call. Making the real
+`startForegroundService()` and then throwing instead of calling `startForeground()` would not be
+faithful: Android would keep waiting for `startForeground()`, while a real refusal clears that wait
+inside `startForeground()` first. Real refusals, which Android 12L raises from `startForeground()`
+and Android 16 from `startForegroundService()`, are covered by ReliefMix's host runner
+(`system_test/android`, `service` category). The harness handler counts errors that reach `AudioService.asyncError` in its
+media item's extras (`asyncErrorCount`, `lastAsyncError`), which the tests read through a
+`MediaController`.
+
+| Method | Checks |
+|---|---|
+| `commandsSentBeforeReplacementEngineConfiguresAreDelivered` | After the first engine is disposed, a replacement engine is created and two handler commands are sent in the same main-thread task, before its Dart side can configure. Both are delivered and the click starts playback |
+| `mediaButtonInsideDisposalWindowNeverLeavesForegroundStartPending` | The playing service is stopped from outside, then a play-pause `MEDIA_BUTTON` broadcast reaches the app's `MediaButtonReceiver` inside the disposal delay (as `MediaSessionService` sends it when no session is left; `cmd media_session dispatch` would target whichever app Android last recorded). No `AudioService` stays `fgRequired` (started with `startForegroundService()` but not yet foreground) for more than 5 s, and the press leaves a paused `AudioService` |
+| `serviceRecreatedWhilePlayingReturnsToForeground` | A playing service is stopped from outside and the Activity returns inside the disposal delay. The recreated service, which replays `playing`, is started in the foreground within 5 s |
+| `refusedForegroundStartLeavesNothingHalfEstablished` | API 31+. `startForeground()` throws `ForegroundServiceStartNotAllowedException` after `startForegroundService()` went through. The service is left not in the playing state, without its wake lock or a foreground service, with its media session still active; Dart gets one `FOREGROUND_START_REFUSED` error |
+| `liveUpdatesWhilePlayingDoNotRetryARefusedStart` | API 31+. After a refusal, 20 live updates (seeks, still playing) make no further attempt, and Dart is still told only once |
+| `activityResumeRetriesARefusedStartOnce` | API 31+. After a refusal, pausing and resuming the Activity makes exactly one more attempt, which puts the service in the foreground with its wake lock and reports nothing to Dart |
+| `foregroundStartFailureReachesDartAndIsNotRetried` | `startForeground()` throws a plain `IllegalStateException`, as for a missing or invalid foreground service type. Dart gets it as `FOREGROUND_START_FAILED`; neither 20 live updates nor an Activity resume retry it; a pause followed by a new play tries once more |
+| `failedRetryOnActivityResumeIsReportedNotThrown` | API 31+. After a refusal, the retry from the Activity's resume fails with a plain `IllegalStateException`. It is reported, not thrown into the lifecycle callback: the process survives, the service keeps playing without the playing state, Dart gets it through `AudioService.asyncError` (code `FOREGROUND_START_FAILED`), and the next resume does not retry. A pause followed by a new play tries once more and reports the failure to Dart |
+| `idleLeavesForegroundOnceAndDestructionDoesNotStopAgain` | RELIEFMIX-3R5. Stopping the playing handler (idle) makes one `stopForeground(STOP_FOREGROUND_REMOVE)` and removes the notification; destroying the service afterwards makes no further `stopForeground()` call |
+| `pauseLeavesForegroundKeepingNotificationAndDestructionDoesNotStopAgain` | Pausing makes one `stopForeground(STOP_FOREGROUND_LEGACY)`, which keeps the notification while the service lives; destroying the service makes no further call, and the notification goes with it |
+| `destructionInForegroundLeavesTheForegroundToTheSystem` | A service destroyed while in the foreground makes no `stopForeground()` call; it ends up out of the foreground and its notification is removed |
+| `recreatedServiceTracksItsOwnForegroundState` | An instance destroyed in the foreground makes no call; its replacement, restored to playing and back in the foreground, leaves it with exactly one `STOP_FOREGROUND_REMOVE` of its own |
+| `refusedForegroundStartOnStateReplayIsReportedToDart` | API 31+. A service destroyed while playing is recreated by a `MediaBrowser`, with no Activity, and replays `playing`; its foreground start is refused. No live update reaches this instance, so the replay reports it: Dart gets one `FOREGROUND_START_REFUSED`, and there is no playing state, wake lock or foreground service |
+| `playAfterPauseKeepingForegroundReusesIt` | With `androidStopForegroundOnPause` false, a pause keeps the foreground service; the next play reuses it (`foreground_start_skipped reason=already_in_foreground`) with no second promotion, which the test would make fail, and takes the wake lock |
+| `refusalAfterStartUndoesTheStart` | API 31+. `START_THEN_REFUSE`: the real `startForegroundService()` goes through and `startForeground()` refuses, as on Android 12L. The refusal undoes the start (`service_start_rolled_back`): the service is no longer started, and Android is not left waiting for `startForeground()`; the Activity's resume still retries. A later refusal after a start that attempt did not make undoes nothing |
+| `serviceWhoseRefusedStartWasUndoneEndsWithItsBindings` | API 31+. After such a refusal, the service is destroyed with its last binding (the Activity closing), as after a refusal of the first phase |
+
+The stop tests grant `POST_NOTIFICATIONS` on API 33+ (declared in the harness manifest) so that
+they can check the notification, and record `stopForeground()` calls through the same seam.
+`onDestroy()` makes no `stopForeground()` call: before calling it, the system has already taken the
+service out of the foreground and cancelled a notification still attached to it
+(`ActiveServices.bringDownServiceLocked`).
+
+### `PlatformErrorTest`
+
+The plugin's unified error handling, `AudioServiceErrors.report()`: an error the plugin catches
+instead of letting it crash the app is logged to logcat and, while an AudioHandler's engine is
+attached, delivered to Dart's `AudioService.asyncError` as a `PlatformException` whose code names
+the method that caught it. The harness handler answers the children of `slow` after five seconds and
+throws for the children of `failing`.
+
+| Method | Checks |
+|---|---|
+| `reportedErrorsReachAsyncErrorFromAnyThread` | Errors reported on the main thread and on the instrumentation thread both reach `AudioService.asyncError`, with their `where` as the code |
+| `reportedErrorWithoutAnEngineIsOnlyLogged` | With no engine, reporting from either thread does not fail, and the error is not delivered to an engine created afterwards |
+| `failingBrowseRequestIsAnsweredWithAnError` | The handler's `getChildren` throws. The subscribing `MediaBrowser` gets `onError` and the process survives. This used to be answered with `Result.sendError()`, which `MediaBrowserServiceCompat` only supports for custom actions. The `UnsupportedOperationException` did not crash the app (Flutter's `MethodChannel` logs an exception thrown by a reply handler) but left the request unanswered |
+| `browseAnswerAfterServiceDestroyedIsReportedNotThrown` | `AudioService` is destroyed while the handler is still answering a `getChildren` request (the engine is kept alive). Building the answer needs the service; the `NullPointerException` used to be logged by `MethodChannel` only, leaving the request unanswered and Dart uninformed. It is logged as `AudioHandlerInterface.getChildren failed` and delivered to Dart (`handler_result method=onPlatformError outcome=success`) |
+
 ## Toolchain
 
 The app was generated by `flutter create` on Flutter 3.47.4 and uses the declarative Flutter
@@ -81,12 +136,133 @@ run `adb shell pm trim-caches 2G` or free space on the emulator.
 
 ## Results
 
+### Second review: rollback, `FOREGROUND_START_FAILED`, `onDestroy()` cleanup
+
+Measured first on API 32 with ReliefMix: after a real refusal of `startForeground()`, the service
+stayed started and non-foreground and audio kept playing after the Activity finished, until Android
+stopped the service about 35 s later (about a minute after the app left the foreground). The refusal
+now undoes a start the same attempt made, so the service lives as long as its bindings on every API.
+
+`26 tests, 0 failed` on the SM-S948U (API 36) and the `android12` AVD (API 32), run in parallel; on the
+VS995 (API 26) 19 pass and the 7 API 31+ tests skip. With the rollback undone,
+`refusalAfterStartUndoesTheStart` fails with `The refused start was not undone` and
+`serviceWhoseRefusedStartWasUndoneEndsWithItsBindings` with `AudioService outlived its last binding`.
+The `onDestroy()` cleanup change has no test: nothing in the harness can make the media session's
+release throw.
+
+### Review fixes: 24 tests on three devices in parallel
+
+`./gradlew :app:connectedDebugAndroidTest` with no `ANDROID_SERIAL` runs on every connected device at
+once. `24 tests, 0 failed` on the Samsung SM-S948U (API 36) and the `android12` AVD (API 32); on the
+LG VS995 (API 26) 19 pass and the 5 API 31+ refusal tests skip. With their fixes undone (the replay
+report and the reuse of a kept foreground service), `refusedForegroundStartOnStateReplayIsReportedToDart`
+fails with `The refused replay was not reported to Dart` and `playAfterPauseKeepingForegroundReusesIt`
+with `The play did not re-enter the playing state` (API 32).
+
+### `lifecycle-repro` @ `ea4ee28` + test fixes: first device run of all 22 tests
+
+Devices: `emulator-5554`, AVD `Phone_Screenshots`, and a Samsung SM-S948U (One UI), both Android 16 /
+API 36, Flutter 3.47.5. `22 tests, 0 failed` on both. On the Samsung too, the notification goes with
+the service without a `stopForeground()` call from `onDestroy()`.
+
+Android 10 / API 29 (AVD `android10`, x86_64; a 32-bit x86 image cannot run Flutter): `22 tests, 0
+failed`, of which the 4 refusal tests that need `ForegroundServiceStartNotAllowedException` skip
+(API 31+). All four stop tests pass, so the system also takes a destroyed service out of the
+foreground and removes its notification before `onDestroy()` on Android 10, as RELIEFMIX-3R5's fix
+assumes. With `ea4ee28` reverted, the four stop tests fail there too, on their recorded calls. One
+attempt ANRed with the main thread in `FlutterJNI.onSurfaceCreated` (the emulator's GL stack, no
+plugin code on the stack) and passed when run again.
+
+Android 12L / API 32 (AVD `android12`, x86_64): `22 tests, 0 failed`, none skipped. Reverting
+`ea4ee28` fails the four stop tests and reverting `cc2bf21` fails the five refusal and failure tests,
+as on API 36. In ReliefMix on this API, a real background refusal comes from `startForeground()`
+after `startForegroundService()` went through, which is the case `ScriptedPromoter`'s REFUSE mode
+simulates; Android left nothing `fgRequired`. On API 36 `startForegroundService()` itself is
+refused. Not run on API 31 or 33.
+
+Android 8.0 / API 26 (LG VS995): `22 tests, 0 failed`, the 4 API 31+ refusal tests skipped; the four
+stop tests pass. The first attempt crashed the app: with the harness's former 1x1 artwork, Android
+8.0 could not lay out the media notification (`RemoteServiceException: Bad notification posted …
+Couldn't inflate contentViews … The given region must intersect with the Bitmap's dimensions`). The
+harness now uses 64x64 artwork. ReliefMix's system tests were not usable on this phone (system
+overloaded, `logd` unresponsive).
+
+After one test fix; on the emulator's first run 20 passed:
+`liveUpdatesWhilePlayingDoNotRetryARefusedStart` and `foregroundStartFailureReachesDartAndIsNotRetried`
+failed with `The live updates were not all applied`. They waited for `PlaybackState.getPosition()` to
+equal the last seek (20000 ms), but `MediaSessionRecord` extrapolates the position of a playing state
+for controllers (seen: `position=49973` after the 30 s wait). The harness `seek()` now also publishes
+the buffered position, which is not extrapolated, and the tests wait for that. The other assumptions
+held: `POST_NOTIFICATIONS` granted through `UiAutomation` lets `getActiveNotifications()` list id 1124;
+`moveToState(STARTED)`/`RESUMED` fires one `onActivityResumed`; relaunches land inside the 1 s window;
+a null browse result reaches the client as `onError`.
+
+Lifecycle log of the stop and refusal tests (`AudioServiceLifecycle`, abridged):
+
+```text
+started: pauseLeavesForegroundKeepingNotificationAndDestructionDoesNotStopAgain
+event=foreground_started serviceGeneration=4 reason=enter_playing_state
+event=foreground_stop_requested serviceGeneration=4 reason=exit_playing_state removeNotification=false
+event=service_destroy_begin serviceGeneration=4 inForeground=false
+started: destructionInForegroundLeavesTheForegroundToTheSystem
+event=foreground_started serviceGeneration=8 reason=enter_playing_state
+event=service_destroy_begin serviceGeneration=8 inForeground=true
+event=service_destroyed_while_playing generation=6 serviceGeneration=8 processingState=ready
+started: idleLeavesForegroundOnceAndDestructionDoesNotStopAgain
+event=foreground_stop_requested serviceGeneration=9 reason=processing_state_idle removeNotification=true
+event=service_destroy_begin serviceGeneration=9 inForeground=false
+started: activityResumeRetriesARefusedStartOnce
+event=foreground_start_refused serviceGeneration=16 error=ForegroundServiceStartNotAllowedException
+event=foreground_retry serviceGeneration=16 reason=activity_resumed
+event=foreground_started serviceGeneration=16 reason=enter_playing_state
+```
+
+`service_destroyed_while_playing` is also logged after an idle stop (`processingState=idle`), because
+`BaseAudioHandler.stop()` publishes idle without clearing `playing`. It is diagnostic only.
+
+Each fix was reverted locally (not committed) to check that its tests catch it:
+
+| Revert | Tests that fail |
+|---|---|
+| `ea4ee28`: `onDestroy()` calls `stopForeground()` again, unconditionally as before | All four stop tests, on their recorded calls, e.g. `onDestroy() must not call stopForeground() again expected:<[REMOVE@9]> but was:<[REMOVE@9, LEGACY@9]>`, and `destructionInForegroundLeavesTheForegroundToTheSystem`: `expected:<[]> but was:<[LEGACY@8]>` |
+| `cc2bf21`: playing flag and wake lock set before the foreground calls | All five refusal/failure tests, e.g. `A refused start must not leave the playing state entered`; `activityResumeRetriesARefusedStartOnce` never retries |
+| `c027986`: retry from the resume callback may throw | `failedRetryOnActivityResumeIsReportedNotThrown`: `FATAL EXCEPTION: main` in `AudioServicePlugin$3.onActivityResumed`, instrumentation process crashed |
+| `5f3beaf`: browse errors answered with `sendError()` | `failingBrowseRequestIsAnsweredWithAnError`: `The client was not told that loading the children failed`. No crash: `MethodChannel` logged `Failed to handle method call result` / `UnsupportedOperationException: It is not supported to send an error for failing` |
+| `5f3beaf`: no guard around building a `getChildren` answer | `browseAnswerAfterServiceDestroyedIsReportedNotThrown`: `The failure to build the answer was not reported`. No crash: `MethodChannel` logged the `NullPointerException` |
+
+So the browse fixes answer requests that were left pending; they did not fix a crash. Flutter's
+`MethodChannel.IncomingResultHandler` has caught exceptions from reply handlers since 2017.
+
+### `lifecycle-repro` (on `minor` @ `4653312`)
+
+Device: `emulator-5554`, AVD `Phone_Screenshots`, Android 16 / API 36.
+
+Before the fixes, `minor` passed the 6 existing tests, including
+`flutterEngineIsDisposedWhenServiceIsDestroyedWhilePlaying`, which had not been run before. The 3 new
+tests failed:
+
+| Test | Failure |
+|---|---|
+| `commandsSentBeforeReplacementEngineConfiguresAreDelivered` | `The media button sent to the replacement engine never started playback`. Log: `handler_invoke method=click flutterReady=true` before `flutter_configure`, then `handler_result method=click outcome=not_implemented`: Flutter's channel buffer discarded the click |
+| `serviceRecreatedWhilePlayingReturnsToForeground` | `The recreated AudioService reports playing but was not started in the foreground` |
+| `mediaButtonInsideDisposalWindowNeverLeavesForegroundStartPending` | `The media button did not leave a paused AudioService; service=null`. The receiver's binding recreated the service with the replayed `playing` state but no foreground service; its unbind destroyed it again (`service_destroyed_while_playing`), and the handler's pause reached `setState` with no service (`NullPointerException`, returned to Dart as a `PlatformException`). No crash: `MediaButtonReceiver` binds, it does not call `startForegroundService()`, because `AudioService` declares no `MEDIA_BUTTON` intent filter |
+
+With the fixes, all 9 tests pass, also on a slow API 35 AVD (`Small_Phone_API_35`, 2 cores, 1 GB). `flutterReady` is reset when the handler's engine detaches. A
+replayed playing state re-enters the playing state (`foreground_retry reason=state_replay`). A refused
+foreground start clears `playingStateEntered`, and the next resume of the attached Activity retries it.
+
+The five refusal and failure tests were added afterwards, together with making the foreground start
+all-or-nothing, and so were the four `PlatformErrorTest` tests, with the unified error handling, and
+the four foreground stop tests; see the next section for their first device run. They need the
+`foregroundPromoter` seam and `AudioServiceErrors`, so they do not compile against earlier revisions.
+
+### Earlier runs
+
 Device: `emulator-5554`, AVD `Phone_Screenshots`, Android 16 / API 36. Flutter 3.47.4.
 
-`flutterEngineIsDisposedWhenServiceIsDestroyedWhilePlaying` was added after these runs and has not
-been executed yet. On `minor` @ `d7cb502`, which still keeps the engine when the service is destroyed
-while playing, it is expected to fail with `FlutterEngine was kept alive after its service was
-destroyed while playing`.
+`flutterEngineIsDisposedWhenServiceIsDestroyedWhilePlaying` was added after these runs. On `minor` @
+`d7cb502`, which still keeps the engine when the service is destroyed while playing, it is expected
+to fail with `FlutterEngine was kept alive after its service was destroyed while playing`.
 
 ### Fix: `claude/audio-service-ownership-reconnect-6x2z0s` passes
 
