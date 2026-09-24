@@ -35,10 +35,12 @@ Future<void> main() async {
   ));
 }
 
-/// A valid 1x1 PNG. A file:// artUri is sent to the platform as its cache
-/// file path, so artwork loads without network access.
+/// A valid 64x64 PNG. A file:// artUri is sent to the platform as its cache
+/// file path, so artwork loads without network access. Android 8.0 cannot lay
+/// out a media notification with 1x1 artwork ("Couldn't inflate contentViews"),
+/// which kills the app.
 const _artworkPng =
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR42u3PQQkAAAgEsItjJtMZ1Qi+hcEKLNXzWgQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQELgtQSiEPtYVDTgAAAABJRU5ErkJggg==';
 
 class _HarnessAudioHandler extends BaseAudioHandler {
   _HarnessAudioHandler() {

@@ -149,6 +149,13 @@ after `startForegroundService()` went through, which is the case `ScriptedPromot
 simulates; Android left nothing `fgRequired`. On API 36 `startForegroundService()` itself is
 refused. Not run on API 31 or 33.
 
+Android 8.0 / API 26 (LG VS995): `22 tests, 0 failed`, the 4 API 31+ refusal tests skipped; the four
+stop tests pass. The first attempt crashed the app: with the harness's former 1x1 artwork, Android
+8.0 could not lay out the media notification (`RemoteServiceException: Bad notification posted …
+Couldn't inflate contentViews … The given region must intersect with the Bitmap's dimensions`). The
+harness now uses 64x64 artwork. ReliefMix's system tests were not usable on this phone (system
+overloaded, `logd` unresponsive).
+
 After one test fix; on the emulator's first run 20 passed:
 `liveUpdatesWhilePlayingDoNotRetryARefusedStart` and `foregroundStartFailureReachesDartAndIsNotRetried`
 failed with `The live updates were not all applied`. They waited for `PlaybackState.getPosition()` to
