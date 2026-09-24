@@ -130,11 +130,12 @@ run `adb shell pm trim-caches 2G` or free space on the emulator.
 
 ### `lifecycle-repro` @ `ea4ee28` + test fixes: first device run of all 22 tests
 
-Device: `emulator-5554`, AVD `Phone_Screenshots`, Android 16 / API 36, Flutter 3.47.5. The
-foreground stop tests have not run on API 29 or 31–33; only API 35/36 images were available, and the
-API 35 AVD did not boot.
+Devices: `emulator-5554`, AVD `Phone_Screenshots`, and a Samsung SM-S948U (One UI), both Android 16 /
+API 36, Flutter 3.47.5. `22 tests, 0 failed` on both. On the Samsung too, the notification goes with
+the service without a `stopForeground()` call from `onDestroy()`. The foreground stop tests have not
+run on API 29 (RELIEFMIX-3R5 was on Android 10) or on API 31–33.
 
-`22 tests, 0 failed`, after one test fix. On the first run 20 passed;
+After one test fix; on the emulator's first run 20 passed:
 `liveUpdatesWhilePlayingDoNotRetryARefusedStart` and `foregroundStartFailureReachesDartAndIsNotRetried`
 failed with `The live updates were not all applied`. They waited for `PlaybackState.getPosition()` to
 equal the last seek (20000 ms), but `MediaSessionRecord` extrapolates the position of a playing state
