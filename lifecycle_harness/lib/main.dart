@@ -15,7 +15,7 @@ import 'package:flutter/widgets.dart';
 /// replayed into a recreated AudioService. Its play() and pause() only publish
 /// a playing or paused state, which puts AudioService in (or takes it out of)
 /// its playing foreground state as real playback would, and seek() publishes
-/// a new position without leaving that state. Errors reaching
+/// a new position (also as the buffered position) without leaving that state. Errors reaching
 /// AudioService.asyncError are counted in the media item's extras, where the
 /// instrumentation tests read them through a MediaController.
 Future<void> main() async {
@@ -58,9 +58,13 @@ class _HarnessAudioHandler extends BaseAudioHandler {
     playbackState.add(playbackState.value.copyWith(playing: false));
   }
 
+  /// Also publishes [position] as the buffered position: Android extrapolates
+  /// the position of a playing state for its controllers, but not the
+  /// buffered position, so tests wait for that to know a seek was applied.
   @override
   Future<void> seek(Duration position) async {
-    playbackState.add(playbackState.value.copyWith(updatePosition: position));
+    playbackState.add(playbackState.value
+        .copyWith(updatePosition: position, bufferedPosition: position));
   }
 
   /// The children of [slowParentMediaId] are answered after five seconds, so

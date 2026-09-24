@@ -512,7 +512,12 @@ public class ForegroundLifecycleTest {
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
     }
 
-    /** Seeks {@link #LIVE_UPDATES} times; each seek is a live state update that keeps playing. */
+    /**
+     * Seeks {@link #LIVE_UPDATES} times; each seek is a live state update that keeps playing. The
+     * harness handler also publishes each position as the buffered position, which is what this
+     * waits for: Android extrapolates the position of a playing state for controllers
+     * (MediaSessionRecord), so the position read here has moved on from the last seek.
+     */
     private void sendLiveUpdates(MediaControllerCompat controller) throws Exception {
         runOnMain(() -> {
             for (int i = 1; i <= LIVE_UPDATES; i++) {
@@ -520,10 +525,11 @@ public class ForegroundLifecycleTest {
             }
             return null;
         });
+        final PlaybackStateCompat[] last = new PlaybackStateCompat[1];
         await("The live updates were not all applied", () -> runOnMain(() -> {
-            final PlaybackStateCompat state = controller.getPlaybackState();
-            return state != null && state.getPosition() == LIVE_UPDATES * 1000L;
-        }), TIMEOUT_MS);
+            final PlaybackStateCompat state = last[0] = controller.getPlaybackState();
+            return state != null && state.getBufferedPosition() == LIVE_UPDATES * 1000L;
+        }), TIMEOUT_MS, () -> "last playback state " + last[0]);
         assertTrue("The handler must keep playing through the updates", AudioService.instance.isPlaying());
     }
 
@@ -675,13 +681,18 @@ public class ForegroundLifecycleTest {
     }
 
     private static void await(String failureMessage, Condition condition, long timeoutMs) throws Exception {
+        await(failureMessage, condition, timeoutMs, () -> "");
+    }
+
+    private static void await(String failureMessage, Condition condition, long timeoutMs,
+            Callable<String> details) throws Exception {
         final long deadline = SystemClock.elapsedRealtime() + timeoutMs;
         while (SystemClock.elapsedRealtime() < deadline) {
             if (condition.holds()) return;
             SystemClock.sleep(25);
         }
         fail(failureMessage + "; pid=" + Process.myPid() + ", service=" + AudioService.instance
-                + ", engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration());
+                + ", engineGeneration=" + AudioServicePlugin.getFlutterEngineGeneration() + " " + details.call());
     }
 
     private static void assertHoldsFor(String failureMessage, Condition condition, long durationMs) throws Exception {
